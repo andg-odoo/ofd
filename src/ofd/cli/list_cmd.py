@@ -71,7 +71,10 @@ def list_cmd(
     # Fall back to plain output when piped, asked, or no entries.
     if plain or not sys.stdout.isatty() or not entries:
         for e in entries:
-            click.echo(f"{e.score}  {e.status:<20s}  {e.rollout_count:>4d}  {e.symbol}")
+            click.echo(
+                f"{e.score}  {e.status:<20s}  {e.active_version:<8s}  "
+                f"{e.rollout_count:>4d}  {e.symbol}"
+            )
         return
 
     from rich.console import Console
@@ -80,6 +83,7 @@ def list_cmd(
     table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
     table.add_column("Score", justify="right", style="bold")
     table.add_column("Status")
+    table.add_column("Version", style="green")
     table.add_column("Rollouts", justify="right")
     table.add_column("Kind", style="dim")
     table.add_column("Symbol")
@@ -89,6 +93,7 @@ def list_cmd(
         table.add_row(
             str(e.score),
             f"[{style}]{e.status}[/]" if style else e.status,
+            e.active_version or "-",
             str(e.rollout_count),
             e.kind,
             e.symbol,

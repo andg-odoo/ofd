@@ -225,3 +225,49 @@ def test_end_to_end_rollout_detected_when_commit_touches_framework(tmp_path: Pat
     rollout = next(c for c in combo_record.changes if c.kind == Kind.ROLLOUT)
     assert rollout.symbol == "odoo.orm.models_cached.CachedModel"
     assert rollout.model == "website"
+
+
+def test_version_bump_updates_detected_version_and_stamps_next_commit(
+    tmp_path: Path, monkeypatch,
+):
+    """Commits after a bump to `odoo/release.py` should be stamped with the
+    new series, independent of what config.yaml's `active_version` says."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    repo = make_repo(tmp_path)
+    repo.commit(
+        {
+            "odoo/release.py": "version_info = (19, 3, 0, 'alpha', 1, '')\n",
+            "odoo/orm/__init__.py": "",
+        },
+        subject="[ADD] baseline 19.3",
+        author="Test User <test@example.com>",
+    )
+    # Bump-only commit; no framework changes.
+    repo.commit(
+        {"odoo/release.py": "version_info = (19, 4, 0, 'alpha', 1, '')\n"},
+        subject="[IMP] core: bump master release to 19.4 alpha",
+        author="Test User <test@example.com>",
+    )
+    # Post-bump commit introduces a framework primitive.
+    post_bump_sha = repo.commit(
+        {
+            "odoo/orm/models_cached.py": (
+                '"""Cached."""\nclass CachedModel:\n    _cached_data_fields = ()\n'
+            ),
+        },
+        subject="[ADD] orm: CachedModel",
+        author="Test User <test@example.com>",
+    )
+
+    workspace = tmp_path / "ws"
+    _write_config(workspace, repo.bare)
+    config = config_mod.load(workspace)
+    state = state_mod.load()
+    summary = run_pipeline(config, state, watchlist_mod.load(workspace))
+    assert not summary.errors
+
+    record = next(
+        cr for cr in iter_repo(workspace, "odoo") if cr.commit.sha == post_bump_sha
+    )
+    assert record.commit.active_version == "19.4"
+    assert state.get("odoo").detected_version == "19.4"

@@ -13,6 +13,10 @@ from pathlib import Path
 class RepoState:
     last_seen_sha: str | None = None
     last_run_at: str | None = None
+    # Last version parsed from odoo/release.py (or repo equivalent). Updated
+    # as commits flow through `process_commit`; used to stamp subsequent
+    # ChangeRecords until the next version-bump commit.
+    detected_version: str | None = None
 
 
 @dataclass
@@ -27,7 +31,11 @@ class State:
         return {
             "schema_version": self.schema_version,
             "repos": {
-                name: {"last_seen_sha": r.last_seen_sha, "last_run_at": r.last_run_at}
+                name: {
+                    "last_seen_sha": r.last_seen_sha,
+                    "last_run_at": r.last_run_at,
+                    "detected_version": r.detected_version,
+                }
                 for name, r in self.repos.items()
             },
         }
@@ -38,6 +46,7 @@ class State:
             name: RepoState(
                 last_seen_sha=r.get("last_seen_sha"),
                 last_run_at=r.get("last_run_at"),
+                detected_version=r.get("detected_version"),
             )
             for name, r in (data.get("repos") or {}).items()
         }

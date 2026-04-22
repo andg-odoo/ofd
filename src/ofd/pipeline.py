@@ -25,6 +25,7 @@ from ofd.events.record import ChangeRecord, CommitEnvelope, CommitRecord
 from ofd.events.store import write as write_record
 from ofd.extractors.dispatcher import extract_for_file
 from ofd.globs import match_any
+from ofd.release_detect import detect_version, is_release_file
 from ofd.rollouts import detect_rollouts, find_model_name
 from ofd.scoring import ScoreContext, score_event
 from ofd.state import State
@@ -76,25 +77,21 @@ def process_commit(
     watchlist: Watchlist,
     preloaded_files: list[str] | None = None,
     blob_fetcher: gitio.BlobFetcher | None = None,
+    repo_state=None,
 ) -> CommitRecord | None:
     """Run extract + rollout + score for one commit. Returns a CommitRecord
     if any changes were found, else None. Does not persist - caller writes.
 
     If `blob_fetcher` is provided, all blob reads go through it (one git
     subprocess for the whole run); otherwise each read spawns its own.
+
+    If `repo_state` is provided, version-bump commits (changes to
+    `odoo/release.py`) update `repo_state.detected_version`; subsequent
+    commits stamp their envelope with that version instead of the config
+    default. This lets ledger frontmatter reflect the series each
+    primitive landed in.
     """
     info = gitio.commit_info(repo.mirror, sha)
-    envelope = CommitEnvelope(
-        sha=info.sha,
-        repo=repo.name,
-        branch=repo.branch,
-        active_version=config.active_version,
-        author_name=info.author_name,
-        author_email=info.author_email,
-        committed_at=info.committed_at,
-        subject=info.subject,
-        body=info.body,
-    )
 
     all_files = (
         preloaded_files if preloaded_files is not None
@@ -107,6 +104,34 @@ def process_commit(
         if blob_fetcher is not None:
             return blob_fetcher.fetch(blob_sha, path)
         return gitio.show_blob(repo.mirror, blob_sha, path)
+
+    # Version detection: if this commit touches release.py, re-parse before
+    # stamping the envelope so the bump commit itself is credited to the
+    # *new* series (useful in the rare case it also changes something
+    # framework-adjacent).
+    if repo_state is not None:
+        for f in all_files:
+            if is_release_file(f):
+                detected = detect_version(_fetch(sha, f))
+                if detected:
+                    repo_state.detected_version = detected
+                break
+
+    active_version = (
+        (repo_state.detected_version if repo_state else None)
+        or config.active_version
+    )
+    envelope = CommitEnvelope(
+        sha=info.sha,
+        repo=repo.name,
+        branch=repo.branch,
+        active_version=active_version,
+        author_name=info.author_name,
+        author_email=info.author_email,
+        committed_at=info.committed_at,
+        subject=info.subject,
+        body=info.body,
+    )
 
     gated_files = [f for f in all_files if match_any(f, repo.framework_paths)]
 
@@ -204,7 +229,18 @@ def run_repo(
         for i, (sha, changed) in enumerate(commits_with_files, start=1):
             touches_gated = any(_is_gated(f, repo.framework_paths) for f in changed)
             needs_rollout_scan = _any_rollout_candidate(changed, watchlist)
+            touches_release = any(is_release_file(f) for f in changed)
             if not touches_gated and not needs_rollout_scan:
+                # Release bumps are commonly one-line changes to release.py
+                # with nothing else. Still parse so detected_version
+                # advances for subsequent commits.
+                if touches_release:
+                    for f in changed:
+                        if is_release_file(f):
+                            v = detect_version(fetcher.fetch(sha, f))
+                            if v:
+                                repo_state.detected_version = v
+                            break
                 repo_state.last_seen_sha = sha
                 repo_state.last_run_at = datetime.now(tz=UTC).isoformat()
                 if progress_cb:
@@ -213,6 +249,7 @@ def run_repo(
             record = process_commit(
                 repo, sha, config, watchlist,
                 preloaded_files=changed, blob_fetcher=fetcher,
+                repo_state=repo_state,
             )
             if record:
                 write_record(config.workspace, record)

@@ -43,6 +43,10 @@ class LedgerEntry:
     def first_seen(self) -> str:
         return str(self.frontmatter.get("first_seen") or "")
 
+    @property
+    def active_version(self) -> str:
+        return str(self.frontmatter.get("active_version") or "")
+
 
 def iter_entries(workspace: Path) -> list[LedgerEntry]:
     entries: list[LedgerEntry] = []
