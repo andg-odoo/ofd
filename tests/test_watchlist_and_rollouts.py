@@ -64,6 +64,39 @@ def test_watchlist_remove():
     assert wl.entries == {}
 
 
+def test_manual_entry_survives_persist(tmp_path: Path):
+    wl = Watchlist()
+    wl.add_manual(
+        symbol="formatted_display_name",
+        active_version="19.4",
+        note="context key on display_name compute",
+    )
+    save(wl, tmp_path)
+    got = load(tmp_path)
+    entry = got.entries["formatted_display_name"]
+    assert entry.source == "manual"
+    assert entry.note == "context key on display_name compute"
+    assert entry.short_name == "formatted_display_name"
+    assert got.manual_entries() == [entry]
+
+
+def test_manual_entry_triggers_rollout_detection():
+    """Pinning a context-key magic string lets the normal rollout
+    matcher find adoption without any extractor involvement."""
+    wl = Watchlist()
+    wl.add_manual(symbol="formatted_display_name", active_version="19.4")
+    patch = """\
+--- a/m.py
++++ b/m.py
+@@ -1,1 +1,2 @@
+ x = 1
++    @api.depends_context('formatted_display_name')
+"""
+    records = detect_rollouts({"m.py": patch}, wl, {})
+    assert len(records) == 1
+    assert records[0].symbol == "formatted_display_name"
+
+
 def test_detect_rollouts_finds_usage_in_hunk():
     wl = _seeded_watchlist()
     patch = """\

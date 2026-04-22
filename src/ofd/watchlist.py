@@ -25,6 +25,13 @@ class WatchlistEntry:
     first_seen_sha: str
     first_seen_at: str          # ISO-8601
     active_version: str
+    # "extracted" when the pipeline found a definition automatically;
+    # "manual" for entries pinned via `ofd watchlist add`. Manual entries
+    # are preserved across reindex since their definition isn't
+    # discoverable from any gated path (magic strings, context keys,
+    # registry entries).
+    source: str = "extracted"
+    note: str | None = None     # free-form user note (manual entries only)
 
 
 @dataclass
@@ -59,6 +66,40 @@ class Watchlist:
         self.entries[record.symbol] = entry
         return entry
 
+    def add_manual(
+        self,
+        symbol: str,
+        active_version: str,
+        note: str | None = None,
+        short_name: str | None = None,
+        kind: Kind = Kind.NEW_DECORATOR_OR_HELPER,
+    ) -> WatchlistEntry:
+        """Pin a symbol for rollout tracking without requiring an extractor hit.
+
+        Use for context keys (`'formatted_display_name'`), registry names,
+        magic strings - anything whose definition isn't reachable via the
+        Python/RNG extractors but whose adoption pattern (string literal,
+        attribute access) is still catchable by the rollout matcher.
+        """
+        short = short_name or symbol.rsplit(".", 1)[-1]
+        entry = WatchlistEntry(
+            symbol=symbol,
+            short_name=short,
+            kind=kind,
+            repo="(manual)",
+            file="(manual)",
+            first_seen_sha="(manual)",
+            first_seen_at="(manual)",
+            active_version=active_version,
+            source="manual",
+            note=note,
+        )
+        self.entries[symbol] = entry
+        return entry
+
+    def manual_entries(self) -> list[WatchlistEntry]:
+        return [e for e in self.entries.values() if e.source == "manual"]
+
     def short_names(self) -> set[str]:
         return {e.short_name for e in self.entries.values()}
 
@@ -84,6 +125,8 @@ class Watchlist:
                 first_seen_sha=v["first_seen_sha"],
                 first_seen_at=v["first_seen_at"],
                 active_version=v["active_version"],
+                source=v.get("source", "extracted"),
+                note=v.get("note"),
             )
             for s, v in raw_entries.items()
         }

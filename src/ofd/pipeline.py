@@ -264,6 +264,20 @@ def run_repo(
     return summaries
 
 
+def _ordered_for_watchlist_build(repos: list[RepoConfig]) -> list[RepoConfig]:
+    """Reorder so framework repos run before rollout-only repos.
+
+    Enterprise has empty `framework_paths` and only contributes rollouts.
+    If it ran first, its commits would scan against an empty watchlist
+    and find nothing. Promote framework-path-bearing repos to the front
+    while preserving relative config order within each group.
+    """
+    framework, adopter = [], []
+    for r in repos:
+        (framework if r.framework_paths else adopter).append(r)
+    return framework + adopter
+
+
 def run(
     config: Config,
     state: State,
@@ -271,7 +285,7 @@ def run(
     progress_cb: ProgressCb | None = None,
 ) -> RunSummary:
     summary = RunSummary()
-    for repo in config.repos:
+    for repo in _ordered_for_watchlist_build(list(config.repos)):
         if not repo.mirror.exists():
             summary.errors.append(f"{repo.name}: mirror missing at {repo.mirror}")
             continue

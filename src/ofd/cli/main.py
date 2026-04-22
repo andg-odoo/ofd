@@ -12,6 +12,7 @@ from ofd.cli.reindex import reindex
 from ofd.cli.rollouts import rollouts
 from ofd.cli.run import run
 from ofd.cli.show import show
+from ofd.cli.watchlist_cmd import watchlist_cli
 
 
 @click.group()
@@ -31,3 +32,4 @@ cli.add_command(reindex)
 cli.add_command(rollouts)
 cli.add_command(run)
 cli.add_command(show)
+cli.add_command(watchlist_cli, name="watchlist")

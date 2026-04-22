@@ -46,7 +46,15 @@ def reindex(
     # `--watchlist-changed` is a v2 optimization; for now it behaves the
     # same as a full rebuild but with the existing watchlist preserved.
     state = state_mod.State()  # wipe state so we re-walk from scratch
-    wl = watchlist_mod.load(workspace) if watchlist_changed else watchlist_mod.Watchlist()
+    if watchlist_changed:
+        wl = watchlist_mod.load(workspace)
+    else:
+        # Fresh watchlist - but carry forward manual pins, since their
+        # definitions aren't discoverable by the extractors.
+        existing = watchlist_mod.load(workspace)
+        wl = watchlist_mod.Watchlist()
+        for entry in existing.manual_entries():
+            wl.entries[entry.symbol] = entry
 
     _apply_since_overrides(state, config, since_overrides)
 
