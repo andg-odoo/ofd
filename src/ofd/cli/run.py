@@ -9,19 +9,26 @@ import click
 from ofd import config as config_mod
 from ofd import state as state_mod
 from ofd import watchlist as watchlist_mod
+from ofd.cli._since import apply_since_overrides as _apply_since_overrides
 from ofd.config import resolve_workspace
 from ofd.pipeline import run as run_pipeline
 
 
 @click.command("run")
 @click.option("--workspace", "workspace_path", default=None, help="Workspace directory.")
-@click.option("--since", "since_override", default=None, help="Override state: process from this commit (exclusive).")
+@click.option(
+    "--since",
+    "since_overrides",
+    multiple=True,
+    default=(),
+    help="Override state. Bare SHA applies to all repos; REPO=SHA scopes to one. Repeatable.",
+)
 @click.option("--quiet", is_flag=True, help="Only print errors.")
 @click.option("--no-fetch", is_flag=True, help="Skip git fetch; use cached mirror state.")
 @click.option("--no-progress", is_flag=True, help="Disable progress bar (default: on in TTY).")
 def run(
     workspace_path: str | None,
-    since_override: str | None,
+    since_overrides: tuple[str, ...],
     quiet: bool,
     no_fetch: bool,
     no_progress: bool,
@@ -39,10 +46,7 @@ def run(
         except Exception as e:
             click.echo(f"fetch failed: {e}", err=True)
 
-    # Since-override routes through state.RepoState for symmetry.
-    if since_override:
-        for repo in config.repos:
-            state.get(repo.name).last_seen_sha = since_override
+    _apply_since_overrides(state, config, since_overrides)
 
     show_progress = not no_progress and not quiet and sys.stderr.isatty()
     if show_progress:
