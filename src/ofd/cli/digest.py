@@ -42,4 +42,16 @@ def digest(
         return
     from rich.console import Console
     from rich.markdown import Markdown
-    Console().print(Markdown(content))
+    from rich.theme import Theme
+
+    # Rich's default `markdown.code` paints a grey block behind inline
+    # backticks that reads as "selected text" in most dark themes. Swap
+    # for a foreground-only style so symbols stay readable.
+    theme = Theme({
+        "markdown.code": "cyan",
+        "markdown.code_block": "cyan",
+        "markdown.h1": "bold",
+        "markdown.h2": "bold magenta",
+        "markdown.h3": "bold yellow",
+    })
+    Console(theme=theme).print(Markdown(content))
