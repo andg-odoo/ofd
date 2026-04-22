@@ -51,16 +51,42 @@ def run(
         summary = run_pipeline(config, state, watchlist)
 
     if not quiet:
-        for repo, commits in summary.repos.items():
-            persisted = sum(1 for c in commits if c.persisted)
-            click.echo(
-                f"{repo}: {len(commits)} commit(s) with framework activity, "
-                f"{persisted} persisted, {summary.total_changes} total events"
-            )
+        _print_summary(summary)
     if summary.errors:
         for err in summary.errors:
             click.echo(err, err=True)
         sys.exit(1)
+
+
+def _print_summary(summary) -> None:
+    """Colored per-repo summary; green check on quiet repos, cyan counts
+    on active ones. Falls back to plain on non-TTY."""
+    if not sys.stdout.isatty():
+        for repo, commits in summary.repos.items():
+            persisted = sum(1 for c in commits if c.persisted)
+            events = sum(c.changes for c in commits)
+            click.echo(
+                f"{repo}: {len(commits)} commit(s), {persisted} persisted, {events} events"
+            )
+        return
+
+    from rich.console import Console
+    console = Console()
+    name_width = max((len(r) for r in summary.repos), default=0)
+    for repo, commits in summary.repos.items():
+        persisted = sum(1 for c in commits if c.persisted)
+        events = sum(c.changes for c in commits)
+        if not commits:
+            console.print(
+                f"[green]✓[/] [bold]{repo:<{name_width}}[/]  [dim]up to date[/]"
+            )
+            continue
+        console.print(
+            f"[cyan]•[/] [bold]{repo:<{name_width}}[/]  "
+            f"[bold]{len(commits)}[/] commit{'s' if len(commits) != 1 else ''}  "
+            f"[dim]·[/]  [bold]{persisted}[/] persisted  "
+            f"[dim]·[/]  [bold cyan]{events}[/] events"
+        )
 
 
 def _run_with_progress(config, state, watchlist):
