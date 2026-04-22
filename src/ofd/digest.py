@@ -84,23 +84,42 @@ def build_sections(
 
 def render(sections: DigestSections, target_date: date) -> str:
     """Render a digest into markdown."""
-    lines: list[str] = [f"# Digest - {target_date.isoformat()}", ""]
+    total_primitives = len(sections.new_primitives)
+    total_rollouts = sum(c for _, c, _ in sections.adoption_velocity)
+    total_deprecations = len(sections.deprecations)
+
+    lines: list[str] = [
+        f"# Digest - {target_date.isoformat()}",
+        "",
+        f"_{total_primitives} new primitive(s) · {total_rollouts} new rollout(s) · "
+        f"{total_deprecations} deprecation(s)._",
+        "",
+    ]
 
     lines.append("## New primitives")
     lines.append("")
     if sections.new_primitives:
+        # Group by kind so the reader scans categories, not a flat list.
+        by_kind: dict[str, list[tuple[str, str]]] = defaultdict(list)
         for sym, kind, subject in sections.new_primitives:
-            lines.append(f"- **{sym}** ({kind}) - {subject}")
+            by_kind[kind].append((sym, subject))
+        for kind in sorted(by_kind):
+            lines.append(f"### {kind.replace('_', ' ')}")
+            lines.append("")
+            for sym, subject in by_kind[kind]:
+                lines.append(f"- **{sym}** - {subject}")
+            lines.append("")
     else:
         lines.append("_None._")
-    lines.append("")
+        lines.append("")
 
     lines.append("## Adoption velocity")
     lines.append("")
     if sections.adoption_velocity:
+        lines.append("| Rollouts | Symbol | Sample commit |")
+        lines.append("|---:|---|---|")
         for sym, count, sha in sections.adoption_velocity:
-            label = f"{count} rollout{'s' if count != 1 else ''}"
-            lines.append(f"- **{sym}** - {label} in window (sample `{sha}`)")
+            lines.append(f"| {count} | `{sym}` | `{sha}` |")
     else:
         lines.append("_No new rollouts of watchlisted primitives._")
     lines.append("")
@@ -109,9 +128,9 @@ def render(sections: DigestSections, target_date: date) -> str:
     lines.append("")
     if sections.deprecations:
         for hint, removal, warning in sections.deprecations:
-            lines.append(f"- **{hint}** - removed in {removal}")
+            lines.append(f"- **{hint}** - removed in **{removal}**")
             if warning:
-                lines.append(f"  - {warning}")
+                lines.append(f"  > {warning}")
     else:
         lines.append("_None._")
     lines.append("")

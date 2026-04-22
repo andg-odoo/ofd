@@ -18,7 +18,14 @@ from ofd.pipeline import run as run_pipeline
 @click.option("--since", "since_override", default=None, help="Override state: process from this commit (exclusive).")
 @click.option("--quiet", is_flag=True, help="Only print errors.")
 @click.option("--no-fetch", is_flag=True, help="Skip git fetch; use cached mirror state.")
-def run(workspace_path: str | None, since_override: str | None, quiet: bool, no_fetch: bool):
+@click.option("--no-progress", is_flag=True, help="Disable progress bar (default: on in TTY).")
+def run(
+    workspace_path: str | None,
+    since_override: str | None,
+    quiet: bool,
+    no_fetch: bool,
+    no_progress: bool,
+):
     """Ingest new commits, extract events, update ledger structural sections."""
     workspace = resolve_workspace(workspace_path)
     config = config_mod.load(workspace)
@@ -37,16 +44,58 @@ def run(workspace_path: str | None, since_override: str | None, quiet: bool, no_
         for repo in config.repos:
             state.get(repo.name).last_seen_sha = since_override
 
-    summary = run_pipeline(config, state, watchlist)
+    show_progress = not no_progress and not quiet and sys.stderr.isatty()
+    if show_progress:
+        summary = _run_with_progress(config, state, watchlist)
+    else:
+        summary = run_pipeline(config, state, watchlist)
 
     if not quiet:
         for repo, commits in summary.repos.items():
             persisted = sum(1 for c in commits if c.persisted)
             click.echo(
-                f"{repo}: {len(commits)} commit(s) scanned, "
-                f"{persisted} with changes, {summary.total_changes} total events"
+                f"{repo}: {len(commits)} commit(s) with framework activity, "
+                f"{persisted} persisted, {summary.total_changes} total events"
             )
     if summary.errors:
         for err in summary.errors:
             click.echo(err, err=True)
         sys.exit(1)
+
+
+def _run_with_progress(config, state, watchlist):
+    """Wrap pipeline.run with a rich progress bar, one task per repo."""
+    from rich.console import Console
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn,
+    )
+
+    console = Console(stderr=True)
+    tasks: dict[str, int] = {}
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold]{task.fields[repo]}"),
+        BarColumn(bar_width=None),
+        MofNCompleteColumn(),
+        TextColumn("[dim]{task.fields[sha]}"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        transient=False,
+    ) as progress:
+
+        def cb(repo_name: str, sha: str, processed: int, total: int) -> None:
+            if repo_name not in tasks:
+                tasks[repo_name] = progress.add_task(
+                    "", total=total, repo=repo_name, sha=sha[:10],
+                )
+            progress.update(tasks[repo_name], completed=processed, sha=sha[:10])
+
+        return run_pipeline(config, state, watchlist, progress_cb=cb)

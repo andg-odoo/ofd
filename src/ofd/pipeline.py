@@ -13,6 +13,7 @@ Per-repo sequential commit processing:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -169,12 +170,22 @@ def process_commit(
     return CommitRecord(commit=envelope, changes=changes)
 
 
+ProgressCb = Callable[[str, str, int, int], None]
+"""progress_cb(repo_name, sha, processed, total)
+
+Called once per commit enumerated. `processed` is the count so far (1-indexed);
+`total` is the full commit count for this repo. Used by the CLI to drive a
+progress bar; pipeline keeps no dependency on rich.
+"""
+
+
 def run_repo(
     repo: RepoConfig,
     config: Config,
     state: State,
     watchlist: Watchlist,
     since_override: str | None = None,
+    progress_cb: ProgressCb | None = None,
 ) -> list[CommitSummary]:
     """Process every new commit on this repo's tracked branch."""
     repo_state = state.get(repo.name)
@@ -186,15 +197,18 @@ def run_repo(
     commits_with_files = gitio.log_commits_with_files(
         repo.mirror, repo.branch, since_sha=since_sha
     )
+    total = len(commits_with_files)
 
     summaries: list[CommitSummary] = []
     with gitio.BlobFetcher(repo.mirror) as fetcher:
-        for sha, changed in commits_with_files:
+        for i, (sha, changed) in enumerate(commits_with_files, start=1):
             touches_gated = any(_is_gated(f, repo.framework_paths) for f in changed)
             needs_rollout_scan = _any_rollout_candidate(changed, watchlist)
             if not touches_gated and not needs_rollout_scan:
                 repo_state.last_seen_sha = sha
                 repo_state.last_run_at = datetime.now(tz=UTC).isoformat()
+                if progress_cb:
+                    progress_cb(repo.name, sha, i, total)
                 continue
             record = process_commit(
                 repo, sha, config, watchlist,
@@ -207,18 +221,27 @@ def run_repo(
                 summaries.append(CommitSummary(sha=sha, changes=0, persisted=False))
             repo_state.last_seen_sha = sha
             repo_state.last_run_at = datetime.now(tz=UTC).isoformat()
+            if progress_cb:
+                progress_cb(repo.name, sha, i, total)
 
     return summaries
 
 
-def run(config: Config, state: State, watchlist: Watchlist) -> RunSummary:
+def run(
+    config: Config,
+    state: State,
+    watchlist: Watchlist,
+    progress_cb: ProgressCb | None = None,
+) -> RunSummary:
     summary = RunSummary()
     for repo in config.repos:
         if not repo.mirror.exists():
             summary.errors.append(f"{repo.name}: mirror missing at {repo.mirror}")
             continue
         try:
-            summary.repos[repo.name] = run_repo(repo, config, state, watchlist)
+            summary.repos[repo.name] = run_repo(
+                repo, config, state, watchlist, progress_cb=progress_cb,
+            )
         except Exception as e:
             summary.errors.append(f"{repo.name}: {e}")
 
