@@ -743,25 +743,75 @@ Optional for `AnthropicBackend`:
 
 ## 17. Open questions / v2 ideas
 
-- **OWL component framework tracking** - currently skipped; would need
-  a proper JS AST. ast-grep rules catch registrations, not prop/hook
-  changes.
-- **Cross-commit narrative** - a primitive introduced Monday then
-  polished across four commits by Friday. Currently each commit is
-  seen in isolation; the ledger merges them but narrative input uses
-  the earliest definition commit.
+Grouped by the category of gap. Ordered roughly by talk-prep ROI.
+
+### Coverage gaps - things the pipeline doesn't see at all
+
+- **JavaScript / OWL framework tracking** - no extractor runs on `.js`
+  files. New OWL hooks, service registrations, registry categories,
+  component APIs, store patterns all land on enterprise web framework
+  and are invisible. Biggest single coverage gap; ast-grep was the
+  original plan. Rules catch registrations well; prop/hook signature
+  diffs need a real JS AST.
+- **Semantic Python patterns, not just definitions** - we catch new
+  classes/methods/kwargs but not new *idioms*. "All `@api.model`
+  swapped for `@api.model_create_multi`", new `@api.depends_context`
+  usage patterns, `_compute_display_name` override shapes. Needs
+  ast-grep-style pattern rules running over gated paths.
+- **Commit body link graph** - Odoo commit bodies carry
+  `Part-of: odoo/odoo#NNNN`, `Fixes #NNN`, `Related: odoo/enterprise#N`,
+  and natural-language "supersedes X"/"replaces Y". We extract the body
+  but don't mine it. Pairing a primitive with its PR narrative would
+  give slide-ready context for free.
+- **Parser-grammar extensions** - domain token additions (`'today'`,
+  `'=5d'`, `'=monday'`) live in string constant tables, not AST
+  symbols. Separate detector needed: diff membership of
+  constant-table dicts/sets in gated files.
+
+### Quality issues - things we catch imperfectly
+
+- **Imprecise rollout matching for RNG-derived short names.** The
+  string-literal rule legitimately catches `<field name="invisible"/>`
+  on fields named "invisible", inflating rollout counts for
+  `widget.invisible` and similar. RNG short names should inherit the
+  generic-name gate, or require parent-element context in the pattern.
+- **Duplicate short names across repos.** `lookup_by_short` returns the
+  first match; all rollouts get attributed to it. Rare at current
+  watchlist size but will bite as coverage grows.
 - **Move/rename detection** - AST-diff sees a moved class as
   remove+add. V1 emits both; stage-3 dedupes heuristically. V2 could
   add a pre-pass that hashes class bodies.
 - **`odoo-ls` integration** - for disambiguating symbol references in
   ambiguous rollout matches. Not needed until false-positive rollouts
   become noisy.
+- **Narrate path untested against real data.** `narrate/` module exists
+  (Claude CLI + SDK backends) but has never been exercised end-to-end.
+  First real run will surface latent issues.
+- **Cross-commit narrative** - a primitive introduced Monday then
+  polished across four commits by Friday. Currently each commit is
+  seen in isolation; the ledger merges them but narrative input uses
+  the earliest definition commit.
+
+### Workflow gaps - data is there, access is missing
+
+- **Per-primitive adoption timeline** - `ofd timeline SYMBOL` plotting
+  rollouts-by-week. Directly consumable as slide content ("introduced
+  in 19.2, steady adoption through 19.4").
+- **Cross-version diff report** - `ofd diff 19.0..master` grouping
+  primitives by the series they landed in, with status counts.
+  Natural lead-in to the slide deck outline.
+- **Author/team stats** - who's driving framework changes this cycle.
+  Raw data already present; no report surfaces it.
+- **Stability signal** - surface `signature_change` events on recent
+  commits so slide content isn't locked around still-churning
+  primitives.
 - **Static frontend** - mkdocs/Astro over the ledger directory.
   Signals to reach for: frequently diffing rollout hunks, wanting
   shortlist UI, charting adoption curves.
-- **Parser-grammar extensions** - domain token additions (`'today'`,
-  `'=5d'`, `'=monday'`) live in string constant tables, not AST
-  symbols. Separate detector needed: diff membership of
-  constant-table dicts/sets in gated files.
+
+### Infrastructure / hygiene
+
 - **Versioning of raw events** - `schema_version: 1` now; migration
   path for future schema changes TBD.
+- **Integrity checks** - nothing validates that raw/*.json,
+  state.json, and watchlist.json stay coherent across partial runs.
