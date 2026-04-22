@@ -15,7 +15,8 @@ from ofd.ledger.read import find, iter_entries
 @click.argument("symbol")
 @click.option("--workspace", "workspace_path", default=None)
 @click.option("--path", "show_path", is_flag=True, help="Print the file path only.")
-def show(symbol: str, workspace_path: str | None, show_path: bool):
+@click.option("--raw", is_flag=True, help="Print raw markdown instead of rendered output.")
+def show(symbol: str, workspace_path: str | None, show_path: bool, raw: bool):
     """Print the ledger entry for SYMBOL.
 
     SYMBOL may be the fully-qualified dotted name or just the last
@@ -30,5 +31,10 @@ def show(symbol: str, workspace_path: str | None, show_path: bool):
         sys.exit(1)
     if show_path:
         click.echo(entry.path)
-    else:
-        click.echo(entry.path.read_text(), nl=False)
+        return
+    content = entry.path.read_text()
+    if raw or not sys.stdout.isatty():
+        click.echo(content, nl=False)
+        return
+    from ofd.cli._theme import print_markdown
+    print_markdown(content)

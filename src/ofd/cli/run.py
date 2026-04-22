@@ -9,6 +9,7 @@ import click
 from ofd import config as config_mod
 from ofd import state as state_mod
 from ofd import watchlist as watchlist_mod
+from ofd.cli._progress import run_pipeline_with_progress, want_progress
 from ofd.cli._since import apply_since_overrides as _apply_since_overrides
 from ofd.config import resolve_workspace
 from ofd.pipeline import run as run_pipeline
@@ -48,9 +49,8 @@ def run(
 
     _apply_since_overrides(state, config, since_overrides)
 
-    show_progress = not no_progress and not quiet and sys.stderr.isatty()
-    if show_progress:
-        summary = _run_with_progress(config, state, watchlist)
+    if want_progress(quiet=quiet, explicit_disable=no_progress):
+        summary = run_pipeline_with_progress(config, state, watchlist)
     else:
         summary = run_pipeline(config, state, watchlist)
 
@@ -93,39 +93,3 @@ def _print_summary(summary) -> None:
         )
 
 
-def _run_with_progress(config, state, watchlist):
-    """Wrap pipeline.run with a rich progress bar, one task per repo."""
-    from rich.console import Console
-    from rich.progress import (
-        BarColumn,
-        MofNCompleteColumn,
-        Progress,
-        SpinnerColumn,
-        TextColumn,
-        TimeElapsedColumn,
-        TimeRemainingColumn,
-    )
-
-    console = Console(stderr=True)
-    tasks: dict[str, int] = {}
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[bold]{task.fields[repo]}"),
-        BarColumn(bar_width=None),
-        MofNCompleteColumn(),
-        TextColumn("[dim]{task.fields[sha]}"),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        console=console,
-        transient=False,
-    ) as progress:
-
-        def cb(repo_name: str, sha: str, processed: int, total: int) -> None:
-            if repo_name not in tasks:
-                tasks[repo_name] = progress.add_task(
-                    "", total=total, repo=repo_name, sha=sha[:10],
-                )
-            progress.update(tasks[repo_name], completed=processed, sha=sha[:10])
-
-        return run_pipeline(config, state, watchlist, progress_cb=cb)

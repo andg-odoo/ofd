@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import PurePosixPath
 
 import click
@@ -17,7 +18,14 @@ from ofd.config import resolve_workspace
 @click.option("--workspace", "workspace_path", default=None)
 @click.option("--limit", type=int, default=10, help="Max hunks to show.")
 @click.option("--diff/--no-diff", "show_diff", default=False, help="Include before/after snippets.")
-def rollouts(symbol: str, workspace_path: str | None, limit: int, show_diff: bool):
+@click.option("--plain", is_flag=True, help="Disable syntax highlighting / colors.")
+def rollouts(
+    symbol: str,
+    workspace_path: str | None,
+    limit: int,
+    show_diff: bool,
+    plain: bool,
+):
     """List rollouts for SYMBOL; with --diff, include before/after hunks."""
     workspace = resolve_workspace(workspace_path)
     config = config_mod.load(workspace)
@@ -29,7 +37,19 @@ def rollouts(symbol: str, workspace_path: str | None, limit: int, show_diff: boo
         click.echo("no rollouts recorded yet")
         return
 
-    for i, r in enumerate(prim.rollouts[:limit]):
+    use_rich = not plain and sys.stdout.isatty()
+    shown = prim.rollouts[:limit]
+    if use_rich:
+        _render_rich(shown, show_diff)
+    else:
+        _render_plain(shown, show_diff)
+
+    if len(prim.rollouts) > limit:
+        click.echo(f"... {len(prim.rollouts) - limit} more")
+
+
+def _render_plain(rollouts, show_diff):
+    for i, r in enumerate(rollouts):
         click.echo(
             f"--- {i+1}. {r.file} @ {r.commit.sha[:12]} ({r.commit.committed_at[:10]}) ---"
         )
@@ -47,8 +67,40 @@ def rollouts(symbol: str, workspace_path: str | None, limit: int, show_diff: boo
         click.echo("```")
         click.echo()
 
-    if len(prim.rollouts) > limit:
-        click.echo(f"... {len(prim.rollouts) - limit} more")
+
+def _render_rich(rollouts, show_diff):
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.syntax import Syntax
+    from rich.text import Text
+
+    console = Console()
+    for i, r in enumerate(rollouts):
+        header = Text()
+        header.append(f"{i+1}. ", style="dim")
+        header.append(r.file, style="bold cyan")
+        header.append(f"  @ {r.commit.sha[:12]}", style="yellow")
+        header.append(f"  ({r.commit.committed_at[:10]})", style="dim")
+        if r.model:
+            header.append("  model=", style="dim")
+            header.append(r.model, style="green")
+        header.append(f"\n{r.commit.subject}", style="dim italic")
+        console.print(header)
+
+        if show_diff:
+            lang = _lang_for(r.file)
+            before = r.before_snippet or ""
+            after = r.after_snippet or ""
+            if before:
+                console.print(Panel(
+                    Syntax(before, lang or "text", theme="ansi_dark", word_wrap=True, background_color="default"),
+                    title="before", title_align="left", border_style="red", padding=(0, 1),
+                ))
+            console.print(Panel(
+                Syntax(after, lang or "text", theme="ansi_dark", word_wrap=True, background_color="default"),
+                title="after", title_align="left", border_style="green", padding=(0, 1),
+            ))
+        console.print()
 
 
 def _lang_for(file: str) -> str:

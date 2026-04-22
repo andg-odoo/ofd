@@ -12,6 +12,7 @@ import click
 from ofd import config as config_mod
 from ofd import state as state_mod
 from ofd import watchlist as watchlist_mod
+from ofd.cli._progress import run_pipeline_with_progress, want_progress
 from ofd.cli._since import apply_since_overrides as _apply_since_overrides
 from ofd.config import resolve_workspace
 from ofd.pipeline import run as run_pipeline
@@ -31,7 +32,13 @@ from ofd.pipeline import run as run_pipeline
     is_flag=True,
     help="Cheaper mode: only the rollout pass is re-run. (Future: when implemented.)",
 )
-def reindex(workspace_path: str | None, since_overrides: tuple[str, ...], watchlist_changed: bool):
+@click.option("--no-progress", is_flag=True, help="Disable progress bar.")
+def reindex(
+    workspace_path: str | None,
+    since_overrides: tuple[str, ...],
+    watchlist_changed: bool,
+    no_progress: bool,
+):
     """Re-run extraction over stored commits."""
     workspace = resolve_workspace(workspace_path)
     config = config_mod.load(workspace)
@@ -43,7 +50,10 @@ def reindex(workspace_path: str | None, since_overrides: tuple[str, ...], watchl
 
     _apply_since_overrides(state, config, since_overrides)
 
-    summary = run_pipeline(config, state, wl)
+    if want_progress(explicit_disable=no_progress):
+        summary = run_pipeline_with_progress(config, state, wl)
+    else:
+        summary = run_pipeline(config, state, wl)
     click.echo(
         f"reindexed {summary.total_commits} commit(s), "
         f"{summary.total_changes} total events"
