@@ -318,3 +318,213 @@ def test_context_match_rejects_name_embedded_in_longer_string():
 """
     records = detect_rollouts({"m.py": patch}, wl, {})
     assert records == []
+
+
+# --- RNG-derived view attributes: scope rollouts to parent element ---
+
+
+def _watchlist_with_rng_attr(element: str, attribute: str) -> Watchlist:
+    """Seed a watchlist with a NEW_VIEW_ATTRIBUTE entry like the RNG
+    extractor would emit (`<element>` gained `<attribute>`)."""
+    wl = Watchlist()
+    wl.add_from_definition(
+        ChangeRecord(
+            kind=Kind.NEW_VIEW_ATTRIBUTE,
+            file="odoo/addons/base/rng/common.rng",
+            line=1,
+            element=element,
+            attribute=attribute,
+            symbol=f"odoo.addons.base.rng.common.{element}.{attribute}",
+        ),
+        repo="odoo", sha="abc", committed_at="2026-03-05T00:00:00Z",
+        active_version="20.0",
+    )
+    return wl
+
+
+def test_rng_attribute_rollout_requires_parent_element():
+    """widget.invisible must match `<widget ... invisible=...>` but NOT
+    `<field ... invisible=...>` or `<setting ... invisible=...>`. This is
+    the core false-positive fix: ~65% of widget.invisible rollouts were
+    actually field/setting usages with the old quoted-string matcher."""
+    wl = _watchlist_with_rng_attr("widget", "invisible")
+
+    widget_patch = """\
+--- a/v.xml
++++ b/v.xml
+@@ -1,1 +1,2 @@
+ <list>
++    <widget name="test_widget" invisible="state == 'draft'"/>
+"""
+    records = detect_rollouts({"v.xml": widget_patch}, wl, {})
+    assert len(records) == 1
+    assert records[0].symbol == "odoo.addons.base.rng.common.widget.invisible"
+
+    field_patch = """\
+--- a/v.xml
++++ b/v.xml
+@@ -1,1 +1,2 @@
+ <form>
++    <field name="adyen_merchant_account" invisible="use_payment_terminal != 'adyen'"/>
+"""
+    assert detect_rollouts({"v.xml": field_patch}, wl, {}) == []
+
+    setting_patch = """\
+--- a/v.xml
++++ b/v.xml
+@@ -1,1 +1,2 @@
+ <settings>
++    <setting id="barcode_scanner" invisible="use_kiosk_mode">text</setting>
+"""
+    assert detect_rollouts({"v.xml": setting_patch}, wl, {}) == []
+
+
+def test_rng_attribute_rollout_does_not_leak_across_tags():
+    """The scoped regex must not match when `invisible` lives on a child
+    element that happens to sit inside a widget tag."""
+    wl = _watchlist_with_rng_attr("widget", "invisible")
+    patch = """\
+--- a/v.xml
++++ b/v.xml
+@@ -1,1 +1,4 @@
+ <list>
++    <widget name="outer">
++        <field name="foo" invisible="1"/>
++    </widget>
+"""
+    assert detect_rollouts({"v.xml": patch}, wl, {}) == []
+
+
+def test_rng_attribute_rollout_multiline_tag():
+    """Widget opening tag split across multiple lines - the scoped regex
+    should still find the attribute when the tag is multi-line."""
+    wl = _watchlist_with_rng_attr("widget", "invisible")
+    patch = """\
+--- a/v.xml
++++ b/v.xml
+@@ -1,1 +1,4 @@
+ <list>
++    <widget
++        name="test_widget"
++        invisible="state == 'draft'"/>
+"""
+    records = detect_rollouts({"v.xml": patch}, wl, {})
+    assert len(records) == 1
+
+
+def test_rng_attribute_rollout_string_literal_no_longer_matches():
+    """Old behavior: `'invisible'` in Python code would trigger a rollout
+    via the quoted-string branch. New behavior: RNG-derived entries only
+    match `<element ... attr=...>`, so this is no longer a match."""
+    wl = _watchlist_with_rng_attr("widget", "invisible")
+    patch = """\
+--- a/m.py
++++ b/m.py
+@@ -1,1 +1,2 @@
+ x = 1
++    return attrs.get('invisible', False)
+"""
+    assert detect_rollouts({"m.py": patch}, wl, {}) == []
+
+
+def test_watchlist_stores_element_for_rng_attr_entries():
+    wl = _watchlist_with_rng_attr("widget", "invisible")
+    entry = wl.entries["odoo.addons.base.rng.common.widget.invisible"]
+    assert entry.element == "widget"
+
+
+def test_watchlist_does_not_store_element_for_python_entries():
+    """Python primitives should leave `element` as None and keep the
+    legacy broad matcher (attribute access, kwargs, string literals)."""
+    wl = _watchlist_with("odoo.orm.models_cached.CachedModel")
+    entry = wl.entries["odoo.orm.models_cached.CachedModel"]
+    assert entry.element is None
+
+
+def test_watchlist_roundtrip_preserves_element(tmp_path: Path):
+    wl = _watchlist_with_rng_attr("widget", "invisible")
+    save(wl, tmp_path)
+    got = load(tmp_path)
+    entry = got.entries["odoo.addons.base.rng.common.widget.invisible"]
+    assert entry.element == "widget"
+
+
+def test_xml_file_uses_slim_contextual_pattern():
+    """XML files should still match quoted-string, attribute-assignment,
+    and attribute-access forms of a watchlisted name. The slimmed
+    per-scope pattern drops Python-only forms but must keep these three
+    to match real QWeb/view adoption."""
+    wl = _watchlist_with("odoo.models.BaseModel.formatted_display_name")
+
+    # 1. <field name="formatted_display_name"/> (quoted-string form).
+    quoted_patch = """\
+--- a/v.xml
++++ b/v.xml
+@@ -1,1 +1,2 @@
+ <tree>
++    <field name="formatted_display_name"/>
+"""
+    assert len(detect_rollouts({"v.xml": quoted_patch}, wl, {})) == 1
+
+    # 2. attribute-access inside a QWeb expression string.
+    qweb_patch = """\
+--- a/v.xml
++++ b/v.xml
+@@ -1,1 +1,2 @@
+ <t t-name="foo">
++    <span t-esc="record.formatted_display_name"/>
+"""
+    assert len(detect_rollouts({"v.xml": qweb_patch}, wl, {})) == 1
+
+
+def test_shared_short_name_emits_one_rollout_per_hunk():
+    """When multiple watchlist entries share a short name (e.g. a new
+    kwarg added to several Field subclasses), a hunk using that name
+    should still emit ONE rollout, not N. Per-entry matching without
+    dedup would balloon rollout counts on shared-name primitives."""
+    wl = Watchlist()
+    # `compute_sql` is non-generic so the rollout pattern actually fires
+    # on `compute_sql=`. Four entries, same short name.
+    for subclass in ("Field", "Binary", "Many2one", "BaseString"):
+        wl.add_from_definition(
+            ChangeRecord(
+                kind=Kind.NEW_KWARG,
+                file=f"odoo/orm/fields_{subclass.lower()}.py",
+                line=1,
+                symbol=f"odoo.orm.fields.{subclass}.__init__.compute_sql",
+            ),
+            repo="odoo", sha="abc", committed_at="2026-04-01T00:00:00Z",
+            active_version="20.0",
+        )
+    patch = """\
+--- a/x.py
++++ b/x.py
+@@ -1,1 +1,2 @@
+ x = 1
++    is_fav = fields.Boolean(compute_sql="_compute_sql_is_fav")
+"""
+    records = detect_rollouts({"x.py": patch}, wl, {})
+    assert len(records) == 1  # NOT 4
+
+
+def test_watchlist_from_dict_backward_compat_missing_element():
+    """Existing watchlist.json files predate the `element` field - they
+    should load cleanly with element=None."""
+    legacy = {
+        "entries": {
+            "odoo.orm.models_cached.CachedModel": {
+                "symbol": "odoo.orm.models_cached.CachedModel",
+                "short_name": "CachedModel",
+                "kind": "new_public_class",
+                "repo": "odoo",
+                "file": "odoo/orm/models_cached.py",
+                "first_seen_sha": "abc",
+                "first_seen_at": "2026-04-01T00:00:00Z",
+                "active_version": "20.0",
+                "source": "extracted",
+                "note": None,
+            }
+        }
+    }
+    wl = Watchlist.from_dict(legacy)
+    assert wl.entries["odoo.orm.models_cached.CachedModel"].element is None

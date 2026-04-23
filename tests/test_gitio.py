@@ -45,6 +45,37 @@ def test_commit_info_parses_body(tmp_path: Path):
     assert "second paragraph" in info.body
 
 
+def test_log_commits_with_files_returns_info_and_files(tmp_path: Path):
+    """Bulk enumeration should give us both per-commit metadata and the
+    file list in one subprocess, so the pipeline doesn't need to call
+    `commit_info` separately for each commit."""
+    repo = make_repo(tmp_path)
+    s1 = repo.commit(
+        {"a.py": "x = 1\n"},
+        "[ADD] base: first",
+        body="With body.",
+        author="Alice <alice@example.com>",
+    )
+    s2 = repo.commit(
+        {"b.py": "y = 2\n", "c.py": "z = 3\n"},
+        "[IMP] base: second",
+        author="Bob <bob@example.com>",
+    )
+    rows = gitio.log_commits_with_files(repo.bare, "master")
+    assert len(rows) == 2
+    first_info, first_files = rows[0]
+    assert first_info.sha == s1
+    assert first_info.author_name == "Alice"
+    assert first_info.subject == "[ADD] base: first"
+    assert "With body." in first_info.body
+    assert first_files == ["a.py"]
+
+    second_info, second_files = rows[1]
+    assert second_info.sha == s2
+    assert second_info.author_email == "bob@example.com"
+    assert set(second_files) == {"b.py", "c.py"}
+
+
 def test_changed_files_and_show_blob(tmp_path: Path):
     repo = make_repo(tmp_path)
     repo.commit({"a.py": "x = 1\n"}, "[ADD] a")

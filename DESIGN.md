@@ -815,3 +815,44 @@ Grouped by the category of gap. Ordered roughly by talk-prep ROI.
   path for future schema changes TBD.
 - **Integrity checks** - nothing validates that raw/*.json,
   state.json, and watchlist.json stay coherent across partial runs.
+
+### Performance follow-ups
+
+The rollout-matching and git-subprocess layers were tuned in the
+2026-04-23 session (matcher cache, bulk `commit_info`, 512 KB hunk
+cap, XML-scope pattern split, progress-bar throttle). py-spy profiles
+still show these remaining hot paths on a full Odoo reindex; order is
+roughly by payoff.
+
+- **`commit_diff_by_file` is per-commit** - ~22% of wall time across
+  ~177k commits. Could be folded into a single `git log --patch`
+  stream per repo, same pattern as the `log_commits_with_files`
+  merge. Parsing the unified-diff output per-commit + per-file is the
+  hard part; structure is `commit <sha>` headers separating diff
+  sections.
+- **`\b(name1|name2|...)\b` pre-filter scales linearly with watchlist
+  size** - Python's `re` engine disables its optimized path on `\b`
+  alternation (benchmarks showed 40x slowdown vs. no-boundary
+  alternation). Dropping `\b` on just the pre-filter admits more
+  false-positive patches into the per-entry regex (slower overall);
+  the real fix is swapping the pre-filter for a multi-pattern trie
+  (e.g. `pyahocorasick`) so per-patch cost stays O(|patch|) regardless
+  of N. Likely explains the "gets slower over time" symptom on long
+  reindexes where the watchlist grows mid-run.
+- **Contextual regex has 11 alternatives with `[^#\n]*` / `\S+`
+  fillers** - The import/from-import alternatives can backtrack on
+  long lines. Splitting `import`/`class`/`def`/`@`/etc. into separate,
+  first-char-anchored alternatives or a single combined prefix-sharing
+  group could cut self time further. Cheap experiment; worth a
+  benchmark before committing.
+- **Progress-bar GIL contention** - at `refresh_per_second=4` the rich
+  thread consumes ~1-3% CPU but contends for the GIL with the main
+  thread. A plain print-every-N-commits fallback when stderr is a
+  pipe or when `--quiet` is set would remove it entirely.
+- **Per-commit parallelism** - commits within a repo are processed
+  sequentially because the watchlist has to be built in commit order.
+  Could be batched: build the watchlist first on framework-path-only
+  commits (already a small subset), then parallelize the rollout-scan
+  pass across the full commit stream. Substantial refactor - probably
+  only worthwhile if single-repo reindex stays above 30 minutes after
+  the above items.

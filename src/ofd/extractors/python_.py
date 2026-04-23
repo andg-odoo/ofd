@@ -16,9 +16,21 @@ from __future__ import annotations
 
 import ast
 import re
+import warnings
 from dataclasses import dataclass
 
 from ofd.events.record import ChangeRecord, Kind
+
+
+def _parse(source: str | None) -> ast.Module | None:
+    """ast.parse, but don't let Odoo source's `\\s`-in-plain-string noise
+    spam stderr during bulk extraction. These SyntaxWarnings are about
+    the parsed code, not ofd."""
+    if source is None:
+        return None
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SyntaxWarning)
+        return ast.parse(source)
 
 
 @dataclass(frozen=True)
@@ -260,8 +272,8 @@ def extract(
     """
     records: list[ChangeRecord] = []
 
-    parent_tree = ast.parse(parent_source) if parent_source else None
-    child_tree = ast.parse(child_source) if child_source else None
+    parent_tree = _parse(parent_source)
+    child_tree = _parse(child_source)
 
     parent_syms = _collect(parent_tree, parent_source or "") if parent_tree else {}
     child_syms = _collect(child_tree, child_source or "") if child_tree else {}

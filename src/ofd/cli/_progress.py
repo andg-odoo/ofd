@@ -42,6 +42,10 @@ def run_pipeline_with_progress(config, state, watchlist):
         TimeRemainingColumn(),
         console=console,
         transient=False,
+        # rich default is 10 Hz; at that rate the live refresh consumed
+        # ~14.6% of reindex wall time in a py-spy profile. 4 Hz is still
+        # a smooth user experience and roughly halves the render cost.
+        refresh_per_second=4,
     ) as progress:
 
         def cb(repo_name: str, sha: str, processed: int, total: int) -> None:

@@ -14,6 +14,14 @@ from pathlib import Path
 
 from ofd.events.record import DEFINITION_KINDS, ChangeRecord, Kind
 
+# Kinds whose rollouts must be scoped to a parent XML element. Carrying
+# `element` past the watchlist turns the quoted-string regex hit on
+# `"invisible"` into a proper `<widget ... invisible=...>` match.
+_ELEMENT_SCOPED_KINDS = frozenset({
+    Kind.NEW_VIEW_ATTRIBUTE,
+    Kind.NEW_VIEW_DIRECTIVE,
+})
+
 
 @dataclass
 class WatchlistEntry:
@@ -32,6 +40,10 @@ class WatchlistEntry:
     # registry entries).
     source: str = "extracted"
     note: str | None = None     # free-form user note (manual entries only)
+    # Parent XML element for RNG-derived primitives. Scopes rollout
+    # matching so a `widget.invisible` entry only matches
+    # `<widget ... invisible=...>`, not any `<field invisible=...>`.
+    element: str | None = None
 
 
 @dataclass
@@ -53,6 +65,7 @@ class Watchlist:
         if record.symbol in self.entries:
             return self.entries[record.symbol]
         short = record.symbol.rsplit(".", 1)[-1]
+        element = record.element if record.kind in _ELEMENT_SCOPED_KINDS else None
         entry = WatchlistEntry(
             symbol=record.symbol,
             short_name=short,
@@ -62,6 +75,7 @@ class Watchlist:
             first_seen_sha=sha,
             first_seen_at=committed_at,
             active_version=active_version,
+            element=element,
         )
         self.entries[record.symbol] = entry
         return entry
@@ -127,6 +141,7 @@ class Watchlist:
                 active_version=v["active_version"],
                 source=v.get("source", "extracted"),
                 note=v.get("note"),
+                element=v.get("element"),
             )
             for s, v in raw_entries.items()
         }

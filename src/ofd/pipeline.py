@@ -76,6 +76,7 @@ def process_commit(
     config: Config,
     watchlist: Watchlist,
     preloaded_files: list[str] | None = None,
+    preloaded_info: gitio.CommitInfo | None = None,
     blob_fetcher: gitio.BlobFetcher | None = None,
     repo_state=None,
 ) -> CommitRecord | None:
@@ -85,13 +86,16 @@ def process_commit(
     If `blob_fetcher` is provided, all blob reads go through it (one git
     subprocess for the whole run); otherwise each read spawns its own.
 
+    If `preloaded_info` is provided (from a bulk `log_commits_with_files`
+    call), the per-commit `commit_info` subprocess is skipped.
+
     If `repo_state` is provided, version-bump commits (changes to
     `odoo/release.py`) update `repo_state.detected_version`; subsequent
     commits stamp their envelope with that version instead of the config
     default. This lets ledger frontmatter reflect the series each
     primitive landed in.
     """
-    info = gitio.commit_info(repo.mirror, sha)
+    info = preloaded_info or gitio.commit_info(repo.mirror, sha)
 
     all_files = (
         preloaded_files if preloaded_files is not None
@@ -226,7 +230,8 @@ def run_repo(
 
     summaries: list[CommitSummary] = []
     with gitio.BlobFetcher(repo.mirror) as fetcher:
-        for i, (sha, changed) in enumerate(commits_with_files, start=1):
+        for i, (info, changed) in enumerate(commits_with_files, start=1):
+            sha = info.sha
             touches_gated = any(_is_gated(f, repo.framework_paths) for f in changed)
             needs_rollout_scan = _any_rollout_candidate(changed, watchlist)
             touches_release = any(is_release_file(f) for f in changed)
@@ -248,8 +253,8 @@ def run_repo(
                 continue
             record = process_commit(
                 repo, sha, config, watchlist,
-                preloaded_files=changed, blob_fetcher=fetcher,
-                repo_state=repo_state,
+                preloaded_files=changed, preloaded_info=info,
+                blob_fetcher=fetcher, repo_state=repo_state,
             )
             if record:
                 write_record(config.workspace, record)
