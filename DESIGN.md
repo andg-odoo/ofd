@@ -730,7 +730,9 @@ digest:
 
 - `click >= 8.1` - CLI
 - `lxml >= 5.0` - XML/RNG parsing
+- `pyahocorasick >= 2.1` - rollout pre-filter (multi-pattern scan)
 - `pyyaml >= 6.0` - config
+- `rich >= 13.0` - progress bars
 
 Optional for `AnthropicBackend`:
 - `anthropic >= 0.40`
@@ -843,20 +845,19 @@ shows ~77% of wall time in `detect_rollouts` regex scans, ~3% in git
 subprocess - the git side is effectively done, the matcher side is
 the remaining lever.
 
-#### Scaling (next session's focus)
+#### Scaling
 
-- **Multi-pattern trie pre-filter** - highest-payoff remaining item.
-  The per-hunk inner loop runs the 11-alt contextual regex once per
-  watchlisted short name that passes a Python-level `if short not in
-  added_blob` test. For ~N=200 entries with ~20-30 generic-name false
-  starts per hunk, that's 20-30 regex scans per hunk - scaling linearly
-  with watchlist size. Explains the "gets slower over time" symptom
-  (watchlist grows from ~80 to ~300+ during a reindex). Swap both the
-  `\b(name1|name2|...)\b` combined pre-filter AND the inner substring
-  loop for a single Aho-Corasick scan (`pyahocorasick` or
-  `ahocorasick-rs`): one C-level pass reports which watchlisted names
-  are present in O(|hunk|), then run the contextual regex only for
-  those. Correctness model unchanged; dep added.
+- **Multi-pattern trie pre-filter** - DONE (commit `c6362cd`,
+  2026-04-24). Both the file-level `\b(name1|name2|...)\b` prefilter
+  and the per-hunk `if short not in added_blob` inner loop are now a
+  single `pyahocorasick` automaton built from the watchlist's short
+  names. Bench (`bench/bench_matcher.py` against an 8.9k-commit
+  corpus): full-watchlist pass 73.6s -> 54.1s (-27%); per-hit cost
+  growth across N=25..86 dropped from +28.3 us/entry to +11.2 us/entry
+  (-60% slope). Parity exact (788/788 records vs the regex-era golden
+  in `bench/golden.jsonl`). The remaining +11 us/entry slope is the
+  per-present-short contextual regex - AC can't touch it; only the
+  ast-grep qualifier (below) can.
 - **`commit_diff_by_file` still per-commit** - ~2.5% of wall time now
   (was 20%+ before the bulk-info merge; git side is nearly free).
   Could still be folded into one `git log --patch` per repo if we
@@ -867,8 +868,7 @@ the remaining lever.
   Could be batched: pass 1 builds the watchlist on framework-path-only
   commits (small subset), pass 2 parallelizes the rollout scan across
   the full commit stream. Substantial refactor - probably only worth
-  doing if single-repo reindex stays above 30 minutes after the trie
-  lands.
+  doing if single-repo reindex stays above 30 minutes post-AC.
 
 #### Correctness limits of regex-based matching
 
@@ -895,8 +895,8 @@ move is a two-stage matcher: fast trie screen → per-file AST qualifier.
   extractor, §5.3). Its pattern DSL expresses "`$X` used as base
   class" or "kwarg `$NAME` passed to `$METHOD`" directly; would fix
   aliasing + string-literal noise for Python rollouts. Higher per-file
-  cost than regex per-hunk, which is why the trie pre-filter has to
-  land first - ast-grep only runs on hunks that passed the screen.
+  cost than regex per-hunk, which is why AC had to land first -
+  ast-grep only runs on hunks that passed the screen.
 - **XML/RNG**: `lxml` is also already a dep (used in the RNG
   extractor, §5.2). Walking the actual element tree in the matcher
   would make element-scoped rollouts bulletproof for nested cases.
@@ -905,9 +905,11 @@ move is a two-stage matcher: fast trie screen → per-file AST qualifier.
   `ast` + `ast-grep` cover the languages we care about without adding
   a heavier dep.
 
-Order of operations when picking this back up: trie → (measure
-correctness complaints) → ast-grep qualifier on .py → lxml qualifier
-on .xml/.rng. Don't jump to stage 2 before the trie lands.
+Order of operations: ~~trie~~ (done) → (measure correctness
+complaints) → ast-grep qualifier on .py → lxml qualifier on .xml/.rng.
+The bench harness in `bench/` gates any future swap on exact parity
+against the regex-era golden, so a stage-2 qualifier that intentionally
+shrinks the false-positive set will need a `--update-golden` step.
 
 #### Smaller odds and ends
 
