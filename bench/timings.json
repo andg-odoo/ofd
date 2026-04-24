@@ -1,0 +1,86 @@
+{
+  "meta": {
+    "workspace": "/home/andg/ofd-workspace",
+    "since_date": "2025-09-01",
+    "repos": [
+      "enterprise",
+      "odoo"
+    ],
+    "total": 8877,
+    "hit": 8377,
+    "miss_kept": 500,
+    "miss_seen": 9288,
+    "watchlist_entries": 86,
+    "short_names": 66
+  },
+  "results": [
+    {
+      "n": "25",
+      "build_ms": 0.39,
+      "median_total_ms": 53918.43,
+      "median_hit_ms": 53856.4,
+      "median_miss_ms": 59.46,
+      "per_hit_us": 6429.08,
+      "per_miss_us": 118.92,
+      "runs_ms": [
+        54137.28,
+        53918.43,
+        53416.35
+      ],
+      "records": 265,
+      "corpus_hit": 8377,
+      "corpus_miss": 500
+    },
+    {
+      "n": "50",
+      "build_ms": 0.66,
+      "median_total_ms": 60212.89,
+      "median_hit_ms": 60133.91,
+      "median_miss_ms": 76.21,
+      "per_hit_us": 7178.45,
+      "per_miss_us": 152.43,
+      "runs_ms": [
+        60208.34,
+        60212.89,
+        60239.29
+      ],
+      "records": 395,
+      "corpus_hit": 8377,
+      "corpus_miss": 500
+    },
+    {
+      "n": "100",
+      "build_ms": 0.18,
+      "median_total_ms": 77932.51,
+      "median_hit_ms": 77822.7,
+      "median_miss_ms": 113.82,
+      "per_hit_us": 9290.04,
+      "per_miss_us": 227.65,
+      "runs_ms": [
+        74435.93,
+        77932.51,
+        83608.42
+      ],
+      "records": 788,
+      "corpus_hit": 8377,
+      "corpus_miss": 500
+    },
+    {
+      "n": "full",
+      "build_ms": 0.21,
+      "median_total_ms": 77705.18,
+      "median_hit_ms": 77601.78,
+      "median_miss_ms": 99.82,
+      "per_hit_us": 9263.67,
+      "per_miss_us": 199.65,
+      "runs_ms": [
+        78057.33,
+        77705.18,
+        77585.39
+      ],
+      "records": 788,
+      "corpus_hit": 8377,
+      "corpus_miss": 500
+    }
+  ]
+}

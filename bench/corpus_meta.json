@@ -1,0 +1,14 @@
+{
+  "workspace": "/home/andg/ofd-workspace",
+  "since_date": "2025-09-01",
+  "repos": [
+    "enterprise",
+    "odoo"
+  ],
+  "total": 8877,
+  "hit": 8377,
+  "miss_kept": 500,
+  "miss_seen": 9288,
+  "watchlist_entries": 86,
+  "short_names": 66
+}
