@@ -25,6 +25,8 @@ import re
 from dataclasses import dataclass
 from functools import lru_cache
 
+import ahocorasick
+
 from ofd.events.record import ChangeRecord, Kind
 from ofd.watchlist import Watchlist
 
@@ -271,10 +273,16 @@ class _Matcher:
     `compiled_by_scope` holds per-(symbol, file_scope) patterns so an
     XML rollout pays a ~6x cheaper regex than the full Python-shaped
     pattern would charge.
+
+    `automaton` is an Aho-Corasick automaton over the short names. One
+    O(|text|) pass reports which watchlisted short names are present,
+    replacing both the file-level `\\b(a|b|...)\\b` prefilter and the
+    per-entry `short in added_blob` inner loop. Both used to scale
+    linearly with watchlist size; AC's single-pass scan is flat.
     """
     by_short: dict[str, list]
     compiled_by_scope: dict[str, dict[str, re.Pattern[str]]]
-    combined: re.Pattern[str]
+    automaton: ahocorasick.Automaton
 
 
 def _file_scope(path: str) -> str:
@@ -298,13 +306,14 @@ def _build_matcher(watchlist: Watchlist) -> _Matcher:
             compiled_by_scope[scope][entry.symbol] = _contextual_pattern(
                 entry.short_name, module, entry.element, scope,
             )
-    combined = re.compile(
-        r"\b(?:" + "|".join(re.escape(n) for n in by_short) + r")\b"
-    )
+    automaton = ahocorasick.Automaton()
+    for short in by_short:
+        automaton.add_word(short, short)
+    automaton.make_automaton()
     return _Matcher(
         by_short=by_short,
         compiled_by_scope=compiled_by_scope,
-        combined=combined,
+        automaton=automaton,
     )
 
 
@@ -355,7 +364,7 @@ def detect_rollouts(
     # watchlist grows.
     matcher = _cached_matcher(watchlist)
     by_short = matcher.by_short
-    combined = matcher.combined
+    automaton = matcher.automaton
 
     def _make_record(file: str, hunk: _Hunk, entry) -> ChangeRecord:
         return ChangeRecord(
@@ -370,7 +379,12 @@ def detect_rollouts(
         )
 
     for file, patch in patches.items():
-        if not combined.search(patch):
+        # File-level early exit: short-circuit AC iter on the first hit.
+        # Replaces a `\b(a|b|...)\b` regex whose cost grew with watchlist
+        # size; the iter stops at the first match, so the no-match case
+        # pays one full O(|patch|) scan either way but the alternation
+        # cost is gone.
+        if next(automaton.iter(patch), None) is None:
             continue
         compiled = matcher.compiled_by_scope[_file_scope(file)]
         for hunk in _parse_patch(patch):
@@ -384,8 +398,18 @@ def detect_rollouts(
             # inside a 10k-line hunk isn't meaningful slide material.
             if len(added_blob) > _MAX_HUNK_CHARS:
                 continue
+            # Single AC pass replaces the per-entry `short in added_blob`
+            # loop: one O(|added_blob|) scan reports every watchlisted
+            # short name present. Before: N substring searches per hunk
+            # (linear in watchlist size, ~46us per extra entry measured
+            # on a full reindex). After: one scan per hunk regardless
+            # of N, then contextual regex runs only on the (usually
+            # small) set of shorts actually present.
+            present_shorts = {value for _, value in automaton.iter(added_blob)}
+            if not present_shorts:
+                continue
             for short, group in by_short.items():
-                if short not in added_blob:
+                if short not in present_shorts:
                     continue
                 if any(e.element is not None for e in group):
                     # Per-entry matching: each entry's pattern is

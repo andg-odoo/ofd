@@ -16,16 +16,16 @@
   "results": [
     {
       "n": "25",
-      "build_ms": 0.39,
-      "median_total_ms": 53918.43,
-      "median_hit_ms": 53856.4,
-      "median_miss_ms": 59.46,
-      "per_hit_us": 6429.08,
-      "per_miss_us": 118.92,
+      "build_ms": 0.07,
+      "median_total_ms": 48285.08,
+      "median_hit_ms": 48253.79,
+      "median_miss_ms": 28.3,
+      "per_hit_us": 5760.27,
+      "per_miss_us": 56.61,
       "runs_ms": [
-        54137.28,
-        53918.43,
-        53416.35
+        48256.78,
+        53965.81,
+        48285.08
       ],
       "records": 265,
       "corpus_hit": 8377,
@@ -33,16 +33,16 @@
     },
     {
       "n": "50",
-      "build_ms": 0.66,
-      "median_total_ms": 60212.89,
-      "median_hit_ms": 60133.91,
-      "median_miss_ms": 76.21,
-      "per_hit_us": 7178.45,
-      "per_miss_us": 152.43,
+      "build_ms": 0.11,
+      "median_total_ms": 49236.33,
+      "median_hit_ms": 49197.05,
+      "median_miss_ms": 36.36,
+      "per_hit_us": 5872.87,
+      "per_miss_us": 72.71,
       "runs_ms": [
-        60208.34,
-        60212.89,
-        60239.29
+        54375.78,
+        49180.09,
+        49236.33
       ],
       "records": 395,
       "corpus_hit": 8377,
@@ -50,16 +50,16 @@
     },
     {
       "n": "100",
-      "build_ms": 0.18,
-      "median_total_ms": 77932.51,
-      "median_hit_ms": 77822.7,
-      "median_miss_ms": 113.82,
-      "per_hit_us": 9290.04,
-      "per_miss_us": 227.65,
+      "build_ms": 0.14,
+      "median_total_ms": 53932.07,
+      "median_hit_ms": 53858.2,
+      "median_miss_ms": 70.71,
+      "per_hit_us": 6429.29,
+      "per_miss_us": 141.42,
       "runs_ms": [
-        74435.93,
-        77932.51,
-        83608.42
+        54540.1,
+        53737.49,
+        53932.07
       ],
       "records": 788,
       "corpus_hit": 8377,
@@ -67,16 +67,16 @@
     },
     {
       "n": "full",
-      "build_ms": 0.21,
-      "median_total_ms": 77705.18,
-      "median_hit_ms": 77601.78,
-      "median_miss_ms": 99.82,
-      "per_hit_us": 9263.67,
-      "per_miss_us": 199.65,
+      "build_ms": 0.14,
+      "median_total_ms": 54062.37,
+      "median_hit_ms": 53988.43,
+      "median_miss_ms": 70.68,
+      "per_hit_us": 6444.84,
+      "per_miss_us": 141.35,
       "runs_ms": [
-        78057.33,
-        77705.18,
-        77585.39
+        54091.12,
+        54062.37,
+        54028.28
       ],
       "records": 788,
       "corpus_hit": 8377,
