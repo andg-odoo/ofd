@@ -22,7 +22,7 @@ from ofd import state as state_mod
 from ofd import watchlist as watchlist_mod
 from ofd.config import Config, RepoConfig
 from ofd.events.record import ChangeRecord, CommitEnvelope, CommitRecord
-from ofd.events.store import write as write_record
+from ofd.events.store import raw_path, write as write_record
 from ofd.extractors.dispatcher import extract_for_file
 from ofd.globs import match_any
 from ofd.release_detect import detect_version, is_release_file
@@ -207,6 +207,12 @@ Called once per commit enumerated. `processed` is the count so far (1-indexed);
 progress bar; pipeline keeps no dependency on rich.
 """
 
+StatusCb = Callable[[str], None]
+"""status_cb(message) - free-form status lines for phases that aren't
+per-commit (repo enumeration, pruning, etc). The CLI prints these so the
+user knows what the dead time between 'start' and 'first tick' is doing.
+"""
+
 
 def run_repo(
     repo: RepoConfig,
@@ -215,18 +221,30 @@ def run_repo(
     watchlist: Watchlist,
     since_override: str | None = None,
     progress_cb: ProgressCb | None = None,
+    status_cb: StatusCb | None = None,
 ) -> list[CommitSummary]:
     """Process every new commit on this repo's tracked branch."""
     repo_state = state.get(repo.name)
     since_sha = since_override or repo_state.last_seen_sha
+    # Apply the config date floor only when the walk isn't already
+    # bounded by a SHA - explicit SHAs take precedence and implicitly
+    # cover a narrower slice.
+    since_date = config.since_date if since_sha is None else None
+
+    if status_cb:
+        bound = since_sha[:10] if since_sha else since_date or "full history"
+        status_cb(f"{repo.name}: enumerating commits (since {bound})...")
 
     # Bulk-enumerate commits + their file lists in a single git call -
     # orders of magnitude faster than per-commit diff-tree when most
     # commits only touch non-gated paths.
     commits_with_files = gitio.log_commits_with_files(
-        repo.mirror, repo.branch, since_sha=since_sha
+        repo.mirror, repo.branch, since_sha=since_sha, since_date=since_date,
     )
     total = len(commits_with_files)
+
+    if status_cb:
+        status_cb(f"{repo.name}: {total} commit(s) to process")
 
     summaries: list[CommitSummary] = []
     with gitio.BlobFetcher(repo.mirror) as fetcher:
@@ -260,6 +278,13 @@ def run_repo(
                 write_record(config.workspace, record)
                 summaries.append(CommitSummary(sha=sha, changes=len(record.changes), persisted=True))
             else:
+                # A previous reindex may have written a raw for this
+                # sha; if the watchlist has since shrunk (via remove or
+                # rebuild), its events are stale. Drop the file so the
+                # ledger pass doesn't resurrect orphaned rollouts.
+                stale = raw_path(config.workspace, repo.name, sha)
+                if stale.exists():
+                    stale.unlink(missing_ok=True)
                 summaries.append(CommitSummary(sha=sha, changes=0, persisted=False))
             repo_state.last_seen_sha = sha
             repo_state.last_run_at = datetime.now(tz=UTC).isoformat()
@@ -288,6 +313,7 @@ def run(
     state: State,
     watchlist: Watchlist,
     progress_cb: ProgressCb | None = None,
+    status_cb: StatusCb | None = None,
 ) -> RunSummary:
     summary = RunSummary()
     for repo in _ordered_for_watchlist_build(list(config.repos)):
@@ -296,7 +322,8 @@ def run(
             continue
         try:
             summary.repos[repo.name] = run_repo(
-                repo, config, state, watchlist, progress_cb=progress_cb,
+                repo, config, state, watchlist,
+                progress_cb=progress_cb, status_cb=status_cb,
             )
         except Exception as e:
             summary.errors.append(f"{repo.name}: {e}")

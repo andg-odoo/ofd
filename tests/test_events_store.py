@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from ofd.events.record import ChangeRecord, CommitEnvelope, CommitRecord, Kind
-from ofd.events.store import iter_repo, read, write
+from ofd.events.store import iter_repo, prune_before, read, write
 
 
 def _envelope(sha: str = "abc123") -> CommitEnvelope:
@@ -63,6 +63,49 @@ def test_iter_repo_yields_all(tmp_path: Path):
 
 def test_iter_repo_missing_returns_empty(tmp_path: Path):
     assert list(iter_repo(tmp_path, "nonexistent")) == []
+
+
+def _envelope_at(sha: str, committed_at: str) -> CommitEnvelope:
+    env = _envelope(sha=sha)
+    env.committed_at = committed_at
+    return env
+
+
+def test_prune_before_drops_old_and_keeps_new(tmp_path: Path):
+    """Pruning respects the `committed_at` date, not file mtime."""
+    old = CommitRecord(
+        commit=_envelope_at("old001", "2015-06-01T00:00:00Z"), changes=[],
+    )
+    recent = CommitRecord(
+        commit=_envelope_at("new001", "2025-10-15T00:00:00Z"), changes=[],
+    )
+    write(tmp_path, old)
+    write(tmp_path, recent)
+
+    deleted = prune_before(tmp_path, "odoo", "2025-09-01")
+    assert deleted == 1
+    surviving = [r.commit.sha for r in iter_repo(tmp_path, "odoo")]
+    assert surviving == ["new001"]
+
+
+def test_prune_before_missing_dir_is_noop(tmp_path: Path):
+    assert prune_before(tmp_path, "never-existed", "2025-01-01") == 0
+
+
+def test_prune_before_skips_malformed_json(tmp_path: Path):
+    """A garbage file shouldn't stop the prune - it'll be overwritten
+    by the next reindex anyway."""
+    (tmp_path / "raw" / "odoo").mkdir(parents=True)
+    (tmp_path / "raw" / "odoo" / "badfile.json").write_text("not json{{")
+    recent = CommitRecord(
+        commit=_envelope_at("new001", "2025-10-15T00:00:00Z"), changes=[],
+    )
+    write(tmp_path, recent)
+    # No crash; the valid recent file stays, bad file stays (it isn't
+    # parseable so we can't tell its date - better to leave it than
+    # assume it's stale).
+    deleted = prune_before(tmp_path, "odoo", "2025-09-01")
+    assert deleted == 0
 
 
 def test_omits_none_fields_in_serialized_output(tmp_path: Path):

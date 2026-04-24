@@ -118,6 +118,7 @@ def log_commits_with_files(
     mirror: Path,
     branch: str,
     since_sha: str | None = None,
+    since_date: str | None = None,
 ) -> list[tuple[CommitInfo, list[str]]]:
     """Bulk-enumerate (CommitInfo, changed_files) pairs in one git call.
 
@@ -127,6 +128,16 @@ def log_commits_with_files(
     Replaces the per-commit `commit_info` + `changed_files` round-trip
     with one subprocess for the whole branch - `commit_info` showed up
     as ~14.7% of reindex wall time when called per commit.
+
+    `since_date` (e.g. "2025-10-01") bounds the walk to commits whose
+    COMMITTER date is on/after that day. git's own `--since` filter
+    uses AUTHOR date, which silently drops commits that were authored
+    earlier but merged/committed into master afterwards (rebased PRs,
+    cherry-picks). We pass git a buffered `--since` (90 days earlier)
+    to keep the walk fast, then filter client-side by `%cI`. The
+    committer-date semantic matches what we store in `committed_at`
+    and what `prune_before` uses, so the walk and the prune agree.
+    Combines with `since_sha`: git ANDs the two floors.
     """
     range_spec = f"{since_sha}..{branch}" if since_sha else branch
     # \x1e bounds each commit section; git's `%x00` emits a NUL between
@@ -135,14 +146,22 @@ def log_commits_with_files(
     # messages. Body goes last so embedded newlines don't confuse the
     # file parser - the closing \x1e is our anchor back to structure.
     fmt = "\x1eCOMMIT%x00%H%x00%an%x00%ae%x00%cI%x00%s%x00%b\x1e"
-    out = _run(
-        [
-            "git", "--git-dir", str(mirror), "log",
-            "--no-merges", "--reverse", "--name-only",
-            f"--format={fmt}",
-            range_spec,
-        ]
-    )
+    args = [
+        "git", "--git-dir", str(mirror), "log",
+        "--no-merges", "--reverse", "--name-only",
+        f"--format={fmt}",
+    ]
+    if since_date:
+        # Pass git a 90-day-earlier buffer so rebased/cherry-picked
+        # commits (author_date older than committer_date) survive git's
+        # author-date-based --since filter. We re-filter below.
+        from datetime import date, timedelta
+        buffered = (
+            date.fromisoformat(since_date) - timedelta(days=90)
+        ).isoformat()
+        args.append(f"--since={buffered}")
+    args.append(range_spec)
+    out = _run(args)
     results: list[tuple[CommitInfo, list[str]]] = []
     current_info: CommitInfo | None = None
     current_files: list[str] = []
@@ -171,6 +190,14 @@ def log_commits_with_files(
                     current_files.append(line)
     if current_info:
         results.append((current_info, current_files))
+    if since_date:
+        # Committer-date filter: git's --since uses author date, which
+        # can leak-out commits whose committer_date >= since_date (the
+        # semantic we actually want). Filter here to enforce it.
+        results = [
+            (info, files) for info, files in results
+            if info.committed_at[:10] >= since_date
+        ]
     return results
 
 

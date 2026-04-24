@@ -37,8 +37,19 @@ def test_load_default_yaml(tmp_path: Path):
     assert "odoo/fields.py" in odoo.framework_paths
     assert "odoo/fields.py" in odoo.core_paths
     assert cfg.narrate.backend == "claude_code"
+    # Default template carries a since_date so a fresh `reindex` doesn't
+    # silently walk 15 years of history.
+    assert cfg.since_date == "2025-10-01"
 
 
 def test_load_missing_raises(tmp_path: Path):
     with pytest.raises(FileNotFoundError):
         load(tmp_path)
+
+
+def test_load_since_date_absent_is_none(tmp_path: Path):
+    (tmp_path / "config.yaml").write_text(
+        "repos: {}\nactive_version: master\n"
+    )
+    cfg = load(tmp_path)
+    assert cfg.since_date is None

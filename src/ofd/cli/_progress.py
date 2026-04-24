@@ -55,7 +55,14 @@ def run_pipeline_with_progress(config, state, watchlist):
                 )
             progress.update(tasks[repo_name], completed=processed, sha=sha[:10])
 
-        return run_pipeline(config, state, watchlist, progress_cb=cb)
+        def status(msg: str) -> None:
+            # rich.Progress clears the bar, prints, redraws - status
+            # lines won't overwrite the active task row.
+            progress.console.print(f"[dim]· {msg}[/]")
+
+        return run_pipeline(
+            config, state, watchlist, progress_cb=cb, status_cb=status,
+        )
 
 
 def want_progress(quiet: bool = False, explicit_disable: bool = False) -> bool:

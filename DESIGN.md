@@ -32,7 +32,7 @@ the annual "What's new in Odoo" engineering talk.
 
 ```
 [ fetch ]    git fetch on bare partial mirrors (parallel across repos)
-[ enumerate ] git log <branch> --since=<last_sha> --no-merges -- <gated_paths>
+[ enumerate ] git log <branch> --since=<last_sha|config.since_date> --no-merges -- <gated_paths>
 [ extract ]  per commit, per file: dispatch to handler by extension
 [ watchlist] new definition events append to the watchlist mid-commit
 [ rollouts ] scan same commit's non-gated diffs for watchlist symbols
@@ -199,6 +199,11 @@ Retroactive scans triggered by:
 - Gated-path additions
 
 Handled by `ofd reindex [--watchlist-changed] [--since=<ref>]`.
+
+`reindex` prunes raws whose `committed_at` falls before `config.since_date`
+before the walk, so shrinking the `since_date` window self-heals the raw
+store. `--since <SHA>` skips pruning (the SHA boundary isn't
+date-comparable and the user may have narrowed the walk intentionally).
 
 ## 7. Scoring
 
@@ -677,6 +682,12 @@ repos:
     core_paths: []
 
 active_version: "20.0"
+
+# Floor for commit enumeration on fresh workspaces. Without it, `reindex`
+# (which wipes state) walks the entire branch back to the first commit
+# ever - which for Odoo is 2010. Pick a date around when the version you
+# care about was cut from master.
+since_date: "2025-10-01"
 
 key_devs:
   - jdoe@odoo.com

@@ -6,13 +6,17 @@ No network, no partial clone filter, just enough to exercise gitio.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 
-def _run(args: list[str], cwd: Path) -> str:
-    r = subprocess.run(args, cwd=str(cwd), capture_output=True, text=True, check=True)
+def _run(args: list[str], cwd: Path, env: dict[str, str] | None = None) -> str:
+    merged = {**os.environ, **env} if env else None
+    r = subprocess.run(
+        args, cwd=str(cwd), capture_output=True, text=True, check=True, env=merged,
+    )
     return r.stdout
 
 
@@ -28,8 +32,13 @@ class FakeRepo:
         subject: str,
         body: str = "",
         author: str = "Test User <test@example.com>",
+        env: dict[str, str] | None = None,
     ) -> str:
-        """Write/delete the given files and commit. Returns the commit SHA."""
+        """Write/delete the given files and commit. Returns the commit SHA.
+
+        `env` lets tests set `GIT_AUTHOR_DATE` / `GIT_COMMITTER_DATE` to
+        exercise date-based filters (`--since=<date>`) deterministically.
+        """
         for rel, content in files.items():
             path = self.work / rel
             if content is None:
@@ -49,6 +58,7 @@ class FakeRepo:
         _run(
             ["git", *env_args, "commit", "-m", message, "--allow-empty"],
             self.work,
+            env=env,
         )
         sha = _run(["git", "rev-parse", "HEAD"], self.work).strip()
         # Push into the bare clone (plain, non-filtered) so consumers see it.

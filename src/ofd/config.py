@@ -56,6 +56,11 @@ class Config:
     key_devs: list[str]
     scoring: ScoringConfig
     narrate: NarrateConfig
+    # Optional ISO date floor (e.g. "2025-10-01"). When the state is
+    # empty (fresh workspace, or reindex wiped state), commit enumeration
+    # is capped with `git log --since=<date>` so we don't scan 15 years
+    # of pre-19.0 history. `--since` CLI overrides still take precedence.
+    since_date: str | None = None
 
     def repo(self, name: str) -> RepoConfig:
         for r in self.repos:
@@ -132,6 +137,7 @@ def load(workspace: Path) -> Config:
         key_devs=data.get("key_devs", []),
         scoring=scoring,
         narrate=narrate,
+        since_date=data.get("since_date"),
     )
 
 
@@ -166,6 +172,12 @@ repos:
       - web_studio/static/src/**
 
 active_version: "20.0"
+
+# Floor for commit enumeration on fresh workspaces. Without this, a
+# `reindex` (which wipes state) walks the entire branch back to the
+# first commit ever. Pick a date around when the version you care about
+# was cut from master.
+since_date: "2025-10-01"
 
 key_devs: []
 

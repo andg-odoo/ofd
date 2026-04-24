@@ -108,6 +108,57 @@ def test_blob_fetcher_reads_multiple_blobs(tmp_path: Path):
         assert fetcher.fetch(s1, "b.py") is None
 
 
+def test_log_commits_with_files_honors_since_date(tmp_path: Path):
+    """`--since=<date>` filters the walk by author date."""
+    import subprocess
+    repo = make_repo(tmp_path)
+    # Two commits far in the past, one in the recent past. `make_repo`
+    # uses real `git commit`, so we have to back-date via env vars.
+    env_old = {
+        "GIT_AUTHOR_DATE": "2010-01-01T00:00:00",
+        "GIT_COMMITTER_DATE": "2010-01-01T00:00:00",
+    }
+    env_new = {
+        "GIT_AUTHOR_DATE": "2026-03-01T00:00:00",
+        "GIT_COMMITTER_DATE": "2026-03-01T00:00:00",
+    }
+    repo.commit({"a.py": "1\n"}, "[ADD] ancient", env=env_old)
+    new_sha = repo.commit({"b.py": "2\n"}, "[ADD] recent", env=env_new)
+
+    # No floor: both commits visible.
+    all_rows = gitio.log_commits_with_files(repo.bare, "master")
+    assert len(all_rows) == 2
+
+    # With a floor just after the old commit, only the recent one survives.
+    recent = gitio.log_commits_with_files(
+        repo.bare, "master", since_date="2020-01-01"
+    )
+    assert [info.sha for info, _ in recent] == [new_sha]
+
+
+def test_log_commits_with_files_uses_committer_date_for_since(tmp_path: Path):
+    """Regression: git's `--since` filters by AUTHOR date, which drops
+    commits whose author date is older but committer date is within the
+    window (e.g. rebased/cherry-picked PRs). Our wrapper must use
+    committer date (`%cI`) so the walk agrees with what we store and
+    what `prune_before` uses."""
+    repo = make_repo(tmp_path)
+    # Author date BEFORE the floor, committer date AFTER the floor.
+    rebased_env = {
+        "GIT_AUTHOR_DATE": "2025-08-15T00:00:00",
+        "GIT_COMMITTER_DATE": "2025-10-15T00:00:00",
+    }
+    rebased_sha = repo.commit(
+        {"r.py": "1\n"}, "[IMP] rebased PR", env=rebased_env,
+    )
+    rows = gitio.log_commits_with_files(
+        repo.bare, "master", since_date="2025-09-01"
+    )
+    assert [info.sha for info, _ in rows] == [rebased_sha], (
+        "rebased commit (author<floor, committer>=floor) must be included"
+    )
+
+
 def test_blob_fetcher_handles_binary(tmp_path: Path):
     repo = make_repo(tmp_path)
     sha = repo.commit({"a.bin": "\x00\x01binary\x02\x00"}, "[ADD] binary")

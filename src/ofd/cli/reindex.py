@@ -7,6 +7,8 @@ asks the pipeline to re-extract that commit.
 
 from __future__ import annotations
 
+import sys
+
 import click
 
 from ofd import config as config_mod
@@ -15,6 +17,7 @@ from ofd import watchlist as watchlist_mod
 from ofd.cli._progress import run_pipeline_with_progress, want_progress
 from ofd.cli._since import apply_since_overrides as _apply_since_overrides
 from ofd.config import resolve_workspace
+from ofd.events.store import prune_before
 from ofd.pipeline import run as run_pipeline
 
 
@@ -58,6 +61,15 @@ def reindex(
 
     _apply_since_overrides(state, config, since_overrides)
 
+    # Prune raws older than the since_date floor so the raw store stays
+    # consistent with what we'd enumerate on this run. Without this,
+    # leftover files from a previous unbounded walk keep propagating
+    # into the ledger. Explicit `--since SHA` overrides skip pruning:
+    # the SHA boundary isn't date-comparable and the user may have
+    # narrowed the walk intentionally.
+    if config.since_date and not since_overrides:
+        _prune_stale_raws(config)
+
     if want_progress(explicit_disable=no_progress):
         summary = run_pipeline_with_progress(config, state, wl)
     else:
@@ -68,3 +80,35 @@ def reindex(
     )
     for err in summary.errors:
         click.echo(err, err=True)
+
+
+def _prune_stale_raws(config) -> None:
+    """Drop raws older than `config.since_date`, per repo, with a rich
+    spinner if we're on a TTY. The scan itself reads every raw's
+    frontmatter, which takes real seconds on a big workspace - worth a
+    status line so the user knows what's happening."""
+    ttyish = sys.stderr.isatty()
+    if ttyish:
+        from rich.console import Console
+        console = Console(stderr=True)
+        for repo in config.repos:
+            with console.status(
+                f"[dim]pruning {repo.name} raws older than "
+                f"{config.since_date}...[/]",
+                spinner="dots",
+            ):
+                n = prune_before(config.workspace, repo.name, config.since_date)
+            if n:
+                console.print(
+                    f"[dim]· {repo.name}: pruned {n} raw(s) "
+                    f"older than {config.since_date}[/]"
+                )
+    else:
+        for repo in config.repos:
+            n = prune_before(config.workspace, repo.name, config.since_date)
+            if n:
+                click.echo(
+                    f"{repo.name}: pruned {n} raw(s) older than "
+                    f"{config.since_date}",
+                    err=True,
+                )

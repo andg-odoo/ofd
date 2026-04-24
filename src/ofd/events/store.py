@@ -47,3 +47,30 @@ def iter_repo(workspace: Path, repo: str) -> Iterator[CommitRecord]:
     for path in sorted(base.glob("*.json")):
         with path.open() as f:
             yield CommitRecord.from_dict(json.load(f))
+
+
+def prune_before(workspace: Path, repo: str, since_date: str) -> int:
+    """Delete raws whose `commit.committed_at` falls before `since_date`.
+
+    Returns the number of files deleted. `since_date` is an ISO date
+    like "2025-09-01"; `committed_at` is a full ISO-8601 timestamp and
+    the YYYY-MM-DD prefix sorts lexicographically the same way.
+
+    Skips malformed files silently so a bad raw doesn't break the whole
+    prune pass - reindex will overwrite them anyway.
+    """
+    base = workspace / "raw" / repo
+    if not base.exists():
+        return 0
+    deleted = 0
+    for path in base.glob("*.json"):
+        try:
+            with path.open() as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        committed_at = (data.get("commit") or {}).get("committed_at") or ""
+        if committed_at[:10] < since_date:
+            path.unlink(missing_ok=True)
+            deleted += 1
+    return deleted
