@@ -177,6 +177,57 @@ def test_ledger_update_symbol_filter(tmp_path: Path, monkeypatch):
     assert summary.written[0].name == "odoo.orm.models_cached.CachedModel.md"
 
 
+def test_ledger_update_prunes_stale_entries(tmp_path: Path, monkeypatch):
+    """Orphaned ledger files (no backing primitive) should be deleted on
+    a full rebuild - otherwise a since_date-bounded reindex leaves
+    stale entries around forever."""
+    workspace, _ = _seed(tmp_path, monkeypatch)
+    config = config_mod.load(workspace)
+    ledger_update(workspace, config)  # baseline, creates CachedModel.md
+
+    stale = (
+        workspace / "ledger" / "new-apis"
+        / "odoo.old.RemovedThing.md"
+    )
+    stale.write_text(
+        "---\nsymbol: odoo.old.RemovedThing\nkind: new_public_class\n"
+        "active_version: master\nstatus: active\nscore: 3\n"
+        "rollout_count: 0\nfirst_seen: '2015-01-01'\n"
+        "last_updated: '2015-01-01'\npinned: false\npin_reason: null\n---\n"
+        "# RemovedThing\n\n"
+        "<!-- ofd:narrative -->\n\n<!-- /ofd:narrative -->\n"
+    )
+
+    summary = ledger_update(workspace, config)
+    assert not stale.exists()
+    assert any(p.name == "odoo.old.RemovedThing.md" for p in summary.deleted)
+
+
+def test_ledger_update_preserves_pinned_stale_entries(
+    tmp_path: Path, monkeypatch,
+):
+    """Pinned entries survive the prune even if their primitive is gone."""
+    workspace, _ = _seed(tmp_path, monkeypatch)
+    config = config_mod.load(workspace)
+    ledger_update(workspace, config)
+
+    pinned_stale = (
+        workspace / "ledger" / "new-apis"
+        / "odoo.manual.Pinned.md"
+    )
+    pinned_stale.write_text(
+        "---\nsymbol: odoo.manual.Pinned\nkind: new_public_class\n"
+        "active_version: master\nstatus: active\nscore: 3\n"
+        "rollout_count: 0\nfirst_seen: '2015-01-01'\n"
+        "last_updated: '2015-01-01'\npinned: true\npin_reason: tracking\n---\n"
+        "# Pinned\n"
+    )
+
+    summary = ledger_update(workspace, config)
+    assert pinned_stale.exists()
+    assert any(p.name == "odoo.manual.Pinned.md" for p in summary.preserved)
+
+
 def test_ledger_update_summary_shows_file_when_stub_upgraded(
     tmp_path: Path, monkeypatch,
 ):
@@ -230,3 +281,26 @@ def test_ledger_update_summary_shows_file_when_stub_upgraded(
     content = entry.read_text()
     assert "Introduced in `odoo/test/new_thing.py`" in content
     assert "Introduced in `?`" not in content
+
+
+def test_ledger_update_symbol_filter_does_not_prune(
+    tmp_path: Path, monkeypatch,
+):
+    """A scoped rebuild (`--symbol X`) must not touch other files - the
+    pruner would otherwise delete everything the scoped pass didn't
+    rewrite. Orphan test: the stale file should still be there after
+    a scoped update."""
+    workspace, _ = _seed(tmp_path, monkeypatch)
+    config = config_mod.load(workspace)
+    ledger_update(workspace, config)
+
+    stale = workspace / "ledger" / "new-apis" / "odoo.unrelated.Thing.md"
+    stale.write_text(
+        "---\nsymbol: odoo.unrelated.Thing\nkind: new_public_class\n---\n"
+    )
+
+    summary = ledger_update(
+        workspace, config, symbol_filter="odoo.orm.models_cached.CachedModel"
+    )
+    assert stale.exists()
+    assert summary.deleted == []

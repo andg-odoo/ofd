@@ -11,8 +11,9 @@ never touched.
 from __future__ import annotations
 
 import os
+import re
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -51,6 +52,8 @@ _DEPRECATION_KINDS = {
 class LedgerSummary:
     written: list[Path]
     skipped: list[str]  # symbol -> reason
+    deleted: list[Path] = field(default_factory=list)
+    preserved: list[Path] = field(default_factory=list)
 
 
 def _category_dir(kind: Kind) -> str:
@@ -173,13 +176,71 @@ def update_one(
     return path
 
 
+_NARRATIVE_BLOCK = re.compile(
+    r"<!-- ofd:narrative -->(.*?)<!-- /ofd:narrative -->", re.DOTALL
+)
+_PINNED_LINE = re.compile(r"^pinned:\s*true\b", re.MULTILINE)
+
+
+def _has_manual_edits(path: Path) -> bool:
+    """True if the file carries user-added content we shouldn't drop.
+
+    Keeps anything pinned or with a non-empty narrative. Defensive: if we
+    can't read the file, treat it as "keep" so we never delete something
+    whose state we can't inspect.
+    """
+    try:
+        txt = path.read_text()
+    except OSError:
+        return True
+    if _PINNED_LINE.search(txt):
+        return True
+    m = _NARRATIVE_BLOCK.search(txt)
+    return bool(m and m.group(1).strip())
+
+
+def _prune_stale_entries(
+    workspace: Path, live_slugs: set[str],
+) -> tuple[list[Path], list[Path]]:
+    """Delete ledger files whose symbols are no longer in `live_slugs`.
+
+    Returns (deleted, preserved). A file is preserved (not deleted) if
+    it has manual content - pins or narrative prose. `live_slugs` is
+    the set of `_slugify(symbol)` names that the current build knows
+    about.
+    """
+    deleted: list[Path] = []
+    preserved: list[Path] = []
+    for category in ("new-apis", "deprecations"):
+        cat_dir = workspace / "ledger" / category
+        if not cat_dir.exists():
+            continue
+        for path in cat_dir.glob("*.md"):
+            if path.stem in live_slugs:
+                continue
+            if _has_manual_edits(path):
+                preserved.append(path)
+                continue
+            path.unlink(missing_ok=True)
+            deleted.append(path)
+    return deleted, preserved
+
+
 def update(
     workspace: Path,
     config: Config,
     symbol_filter: str | None = None,
     force_narrative: bool = False,
 ) -> LedgerSummary:
-    """Refresh every ledger entry (or the one matching `symbol_filter`)."""
+    """Refresh every ledger entry (or the one matching `symbol_filter`).
+
+    On a full rebuild (no `symbol_filter`), also deletes stale entries
+    whose primitives are no longer in the raw store - this is what
+    keeps the ledger in sync with `since_date`-bounded reindexes.
+    Entries with pins or narratives are preserved so manual work isn't
+    dropped. Scoped rebuilds (`--symbol X`) never prune; they'd risk
+    deleting unrelated entries.
+    """
     repo_names = [r.name for r in config.repos]
     primitives = build_primitives(workspace, repo_names)
 
@@ -194,4 +255,16 @@ def update(
             continue
         written.append(update_one(prim, workspace, config, force_narrative=force_narrative))
 
-    return LedgerSummary(written=written, skipped=skipped)
+    deleted: list[Path] = []
+    preserved: list[Path] = []
+    if not symbol_filter:
+        live_slugs = {
+            _slugify(sym)
+            for sym, prim in primitives.items()
+            if prim.kind in _NEW_API_KINDS | _DEPRECATION_KINDS
+        }
+        deleted, preserved = _prune_stale_entries(workspace, live_slugs)
+
+    return LedgerSummary(
+        written=written, skipped=skipped, deleted=deleted, preserved=preserved,
+    )

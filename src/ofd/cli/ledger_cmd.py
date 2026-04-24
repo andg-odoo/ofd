@@ -27,6 +27,15 @@ def update_cmd(workspace_path: str | None, symbol: str | None, force_narrative: 
         workspace, config, symbol_filter=symbol, force_narrative=force_narrative
     )
     click.echo(f"wrote {len(summary.written)} ledger file(s)")
+    if summary.deleted:
+        click.echo(
+            f"pruned {len(summary.deleted)} stale ledger file(s)"
+        )
+    if summary.preserved:
+        click.echo(
+            f"preserved {len(summary.preserved)} stale file(s) with manual edits",
+            err=True,
+        )
     for skipped in summary.skipped:
         click.echo(f"skipped: {skipped}", err=True)
 

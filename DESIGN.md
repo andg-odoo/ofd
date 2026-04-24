@@ -205,6 +205,12 @@ before the walk, so shrinking the `since_date` window self-heals the raw
 store. `--since <SHA>` skips pruning (the SHA boundary isn't
 date-comparable and the user may have narrowed the walk intentionally).
 
+`ledger update` similarly prunes ledger files whose symbols no longer
+have backing events in the raw store. Entries with manual content
+(`pinned: true` or a non-empty `<!-- ofd:narrative -->` block) survive
+the prune so user edits aren't lost. Scoped rebuilds (`--symbol X`)
+never prune - otherwise they'd delete everything they didn't rewrite.
+
 ## 7. Scoring
 
 ### 7.1 Per-event base scores
