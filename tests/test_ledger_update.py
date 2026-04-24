@@ -175,3 +175,58 @@ def test_ledger_update_symbol_filter(tmp_path: Path, monkeypatch):
     )
     assert len(summary.written) == 1
     assert summary.written[0].name == "odoo.orm.models_cached.CachedModel.md"
+
+
+def test_ledger_update_summary_shows_file_when_stub_upgraded(
+    tmp_path: Path, monkeypatch,
+):
+    """Regression: if a rollout for a symbol was seen before its
+    defining commit (SHA-sort order), the resulting ledger entry used
+    to render `Introduced in '?'` because `prim.file` was stuck at None.
+    After the aggregate fix, the summary must carry the real file path."""
+    from ofd.events.record import (
+        ChangeRecord, CommitEnvelope, CommitRecord, Kind,
+    )
+    from ofd.events.store import write
+
+    workspace, _ = _seed(tmp_path, monkeypatch)
+    config = config_mod.load(workspace)
+
+    # Inject a rollout-first-then-definition pair for a fresh symbol.
+    rollout = CommitRecord(
+        commit=CommitEnvelope(
+            sha="0" * 40, repo="odoo", branch="master",
+            active_version="master",
+            author_name="Rollout Dev", author_email="ro@odoo.com",
+            committed_at="2026-01-01T00:00:00Z",
+            subject="[IMP] adopt", body="",
+        ),
+        changes=[ChangeRecord(
+            kind=Kind.ROLLOUT, file="addons/x/y.xml", line=1,
+            symbol="odoo.test.NewThing",
+        )],
+    )
+    definition = CommitRecord(
+        commit=CommitEnvelope(
+            sha="f" * 40, repo="odoo", branch="master",
+            active_version="master",
+            author_name="Def Dev", author_email="def@odoo.com",
+            committed_at="2026-02-01T00:00:00Z",
+            subject="[ADD] test: introduce NewThing", body="",
+        ),
+        changes=[ChangeRecord(
+            kind=Kind.NEW_PUBLIC_CLASS,
+            file="odoo/test/new_thing.py", line=10,
+            symbol="odoo.test.NewThing",
+            signature="class NewThing",
+        )],
+    )
+    write(workspace, rollout)
+    write(workspace, definition)
+
+    ledger_update(workspace, config)
+    entry = workspace / "ledger" / "new-apis" / "odoo.test.NewThing.md"
+    assert entry.exists()
+    content = entry.read_text()
+    assert "Introduced in `odoo/test/new_thing.py`" in content
+    assert "Introduced in `?`" not in content

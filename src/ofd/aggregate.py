@@ -154,6 +154,19 @@ def build_primitives(
                             after_snippet=change.after_snippet,
                         )
                         primitives[change.symbol] = prim
+                    else:
+                        # Upgrade a stub primitive (created by a rollout seen
+                        # first due to SHA-sort iteration order) now that we
+                        # have the real definition event. Without this, the
+                        # summary renders `Introduced in '?'` and the ledger
+                        # category can be wrong because `kind` was guessed.
+                        if prim.definition_record is None:
+                            prim.definition_record = change
+                            prim.kind = change.kind
+                            prim.file = change.file
+                            prim.signature = change.signature
+                            prim.after_snippet = change.after_snippet
+                            prim.active_version = commit_record.commit.active_version
                     prim.definition_commits.append(ref)
                 elif change.kind == Kind.ROLLOUT:
                     prim = primitives.get(change.symbol)
