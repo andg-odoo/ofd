@@ -840,11 +840,12 @@ roughly by payoff.
   of N. Likely explains the "gets slower over time" symptom on long
   reindexes where the watchlist grows mid-run.
 - **Contextual regex has 11 alternatives with `[^#\n]*` / `\S+`
-  fillers** - The import/from-import alternatives can backtrack on
-  long lines. Splitting `import`/`class`/`def`/`@`/etc. into separate,
-  first-char-anchored alternatives or a single combined prefix-sharing
-  group could cut self time further. Cheap experiment; worth a
-  benchmark before committing.
+  fillers** - The import/from-import alternatives are now line-anchored
+  (`re.MULTILINE` + `^\s*import`) with non-greedy fillers, after a
+  profile caught 51s of 90s spent on one regex call. A deeper cleanup
+  would split `class`/`def`/`@` into a shared prefix form, or move
+  all rarely-matching Python-specific alternatives behind a cheaper
+  first-pass filter. Cheap experiment; benchmark before committing.
 - **Progress-bar GIL contention** - at `refresh_per_second=4` the rich
   thread consumes ~1-3% CPU but contends for the GIL with the main
   thread. A plain print-every-N-commits fallback when stderr is a

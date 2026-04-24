@@ -30,12 +30,12 @@ from ofd.watchlist import Watchlist
 
 _HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@.*$")
 
-# Cap on the added-side text we'll scan per hunk. At 512 KB, a normal
-# refactor hunk fits comfortably; a copy-pasted fixture file or mass
-# renaming sweep doesn't. Purely a worst-case safety valve for the
-# contextual regex, which has 11 alternatives with `\s+` / `[^#\n]*`
-# fillers that can degrade to seconds on large inputs.
-_MAX_HUNK_CHARS = 512 * 1024
+# Cap on the added-side text we'll scan per hunk. Above ~100 KB the
+# contextual regex degrades sharply even with the anchored-import fix:
+# a 90s py-spy saw 51s on a single call on a commit that passed the
+# previous 512 KB cap. Any primitive hiding in a single hunk larger
+# than 128 KB is a mass refactor / generated file, not slide content.
+_MAX_HUNK_CHARS = 128 * 1024
 _FILE_HEADER = re.compile(r"^\+\+\+ b/(.+)$")
 _CLASS_LINE = re.compile(r"^\s*class\s+(\w+)")
 _MODEL_ATTR = re.compile(r"""_name\s*=\s*['"]([^'"]+)['"]""")
@@ -112,24 +112,32 @@ def _contextual_pattern(
     if name in _GENERIC_SHORT_NAMES:
         # Only match if the watchlisted name shows up in an explicit
         # import. If we know the defining module, prefer its own import.
+        # Non-greedy filler + line-anchored `^\s*from`/`^\s*import` to
+        # avoid catastrophic backtracking on long strings containing
+        # the word "import".
         if module_path:
             mod_escaped = re.escape(module_path)
             return re.compile(
-                rf"(?:from\s+{mod_escaped}\s+import\s+[^#\n]*\b{escaped}\b)"
-                rf"|(?:^\s*import\s+[^#\n]*\b{escaped}\b)",
+                rf"(?:^\s*from\s+{mod_escaped}\s+import\s+[^#\n]*?\b{escaped}\b)"
+                rf"|(?:^\s*import\s+[^#\n]*?\b{escaped}\b)",
                 re.MULTILINE,
             )
         return re.compile(
-            rf"(?:from\s+\S+\s+import\s+[^#\n]*\b{escaped}\b)"
-            rf"|(?:^\s*import\s+[^#\n]*\b{escaped}\b)",
+            rf"(?:^\s*from\s+\S+\s+import\s+[^#\n]*?\b{escaped}\b)"
+            rf"|(?:^\s*import\s+[^#\n]*?\b{escaped}\b)",
             re.MULTILINE,
         )
+    # re.MULTILINE + `^\s*` anchors the import alternatives to actual
+    # statement lines. Without it, `import` mentioned inside a string
+    # or comment can trigger catastrophic backtracking on the `[^#\n]*`
+    # filler (a live reindex wasted 51s of 90s on a single call). Also
+    # use non-greedy `*?` so the engine doesn't overshoot then backtrack.
     return re.compile(
         rf"(?:\.{escaped}\b)"
         rf"|(?:\b{escaped}\s*\()"
         rf"|(?:\b{escaped}\s*=(?!=))"
-        rf"|(?:\bimport\s+[^#\n]*\b{escaped}\b)"
-        rf"|(?:\bfrom\s+\S+\s+import\s+[^#\n]*\b{escaped}\b)"
+        rf"|(?:^\s*import\s+[^#\n]*?\b{escaped}\b)"
+        rf"|(?:^\s*from\s+\S+\s+import\s+[^#\n]*?\b{escaped}\b)"
         rf"|(?:\bclass\s+{escaped}\b)"
         rf"|(?:\bdef\s+{escaped}\b)"
         rf"|(?:@{escaped}\b)"
@@ -142,7 +150,8 @@ def _contextual_pattern(
         # `@api.depends_context('foo')`. Two alternatives beat one back-reference
         # - Python's re engine falls off its optimized path on \1 patterns.
         rf"|(?:'{escaped}')"
-        rf"|(?:\"{escaped}\")"
+        rf"|(?:\"{escaped}\")",
+        re.MULTILINE,
     )
 
 
