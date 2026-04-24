@@ -819,41 +819,89 @@ Grouped by the category of gap. Ordered roughly by talk-prep ROI.
 ### Performance follow-ups
 
 The rollout-matching and git-subprocess layers were tuned in the
-2026-04-23 session (matcher cache, bulk `commit_info`, 512 KB hunk
-cap, XML-scope pattern split, progress-bar throttle). py-spy profiles
-still show these remaining hot paths on a full Odoo reindex; order is
-roughly by payoff.
+2026-04-23 session (matcher cache, bulk `commit_info`, 128 KB hunk
+cap, XML-scope pattern split, progress-bar throttle, line-anchored
+import alternatives). After those changes, py-spy on a live reindex
+shows ~77% of wall time in `detect_rollouts` regex scans, ~3% in git
+subprocess - the git side is effectively done, the matcher side is
+the remaining lever.
 
-- **`commit_diff_by_file` is per-commit** - ~22% of wall time across
-  ~177k commits. Could be folded into a single `git log --patch`
-  stream per repo, same pattern as the `log_commits_with_files`
-  merge. Parsing the unified-diff output per-commit + per-file is the
-  hard part; structure is `commit <sha>` headers separating diff
-  sections.
-- **`\b(name1|name2|...)\b` pre-filter scales linearly with watchlist
-  size** - Python's `re` engine disables its optimized path on `\b`
-  alternation (benchmarks showed 40x slowdown vs. no-boundary
-  alternation). Dropping `\b` on just the pre-filter admits more
-  false-positive patches into the per-entry regex (slower overall);
-  the real fix is swapping the pre-filter for a multi-pattern trie
-  (e.g. `pyahocorasick`) so per-patch cost stays O(|patch|) regardless
-  of N. Likely explains the "gets slower over time" symptom on long
-  reindexes where the watchlist grows mid-run.
-- **Contextual regex has 11 alternatives with `[^#\n]*` / `\S+`
-  fillers** - The import/from-import alternatives are now line-anchored
-  (`re.MULTILINE` + `^\s*import`) with non-greedy fillers, after a
-  profile caught 51s of 90s spent on one regex call. A deeper cleanup
-  would split `class`/`def`/`@` into a shared prefix form, or move
-  all rarely-matching Python-specific alternatives behind a cheaper
-  first-pass filter. Cheap experiment; benchmark before committing.
-- **Progress-bar GIL contention** - at `refresh_per_second=4` the rich
-  thread consumes ~1-3% CPU but contends for the GIL with the main
-  thread. A plain print-every-N-commits fallback when stderr is a
-  pipe or when `--quiet` is set would remove it entirely.
+#### Scaling (next session's focus)
+
+- **Multi-pattern trie pre-filter** - highest-payoff remaining item.
+  The per-hunk inner loop runs the 11-alt contextual regex once per
+  watchlisted short name that passes a Python-level `if short not in
+  added_blob` test. For ~N=200 entries with ~20-30 generic-name false
+  starts per hunk, that's 20-30 regex scans per hunk - scaling linearly
+  with watchlist size. Explains the "gets slower over time" symptom
+  (watchlist grows from ~80 to ~300+ during a reindex). Swap both the
+  `\b(name1|name2|...)\b` combined pre-filter AND the inner substring
+  loop for a single Aho-Corasick scan (`pyahocorasick` or
+  `ahocorasick-rs`): one C-level pass reports which watchlisted names
+  are present in O(|hunk|), then run the contextual regex only for
+  those. Correctness model unchanged; dep added.
+- **`commit_diff_by_file` still per-commit** - ~2.5% of wall time now
+  (was 20%+ before the bulk-info merge; git side is nearly free).
+  Could still be folded into one `git log --patch` per repo if we
+  need to squeeze more, but probably not worth the complexity until
+  other items ship.
 - **Per-commit parallelism** - commits within a repo are processed
   sequentially because the watchlist has to be built in commit order.
-  Could be batched: build the watchlist first on framework-path-only
-  commits (already a small subset), then parallelize the rollout-scan
-  pass across the full commit stream. Substantial refactor - probably
-  only worthwhile if single-repo reindex stays above 30 minutes after
-  the above items.
+  Could be batched: pass 1 builds the watchlist on framework-path-only
+  commits (small subset), pass 2 parallelizes the rollout scan across
+  the full commit stream. Substantial refactor - probably only worth
+  doing if single-repo reindex stays above 30 minutes after the trie
+  lands.
+
+#### Correctness limits of regex-based matching
+
+Regex is doing *pattern recognition*, not parsing, so the usual "don't
+parse HTML with regex" objection doesn't apply. We're not reconstructing
+structure - we're asking "does identifier X appear in a meaningful
+context on an added line?" which regex handles correctly. That said,
+there are real accuracy limits we accept today:
+
+- **Import aliasing** - `from .models import CachedModel as CM; class
+  Foo(CM)` is a rollout that we miss.
+- **Docstring / comment / string-literal noise** - `CachedModel`
+  mentioned in a docstring or log message counts as a rollout.
+- **Nested XML element scope** - the `widget.invisible` fix works for
+  inline `<widget invisible="x"/>` but fails on
+  `<widget><tooltip invisible="x"/></widget>` where `invisible`
+  belongs to `tooltip`. The `[^<]*?` bound limits damage to immediate
+  children.
+
+If correctness complaints ever outweigh perf complaints, the principled
+move is a two-stage matcher: fast trie screen → per-file AST qualifier.
+
+- **Python**: `ast-grep` is already a project dep (used for the JS
+  extractor, §5.3). Its pattern DSL expresses "`$X` used as base
+  class" or "kwarg `$NAME` passed to `$METHOD`" directly; would fix
+  aliasing + string-literal noise for Python rollouts. Higher per-file
+  cost than regex per-hunk, which is why the trie pre-filter has to
+  land first - ast-grep only runs on hunks that passed the screen.
+- **XML/RNG**: `lxml` is also already a dep (used in the RNG
+  extractor, §5.2). Walking the actual element tree in the matcher
+  would make element-scoped rollouts bulletproof for nested cases.
+  Narrow, bounded scope.
+- **Full CFG (tree-sitter)** - no current reason to reach for it.
+  `ast` + `ast-grep` cover the languages we care about without adding
+  a heavier dep.
+
+Order of operations when picking this back up: trie → (measure
+correctness complaints) → ast-grep qualifier on .py → lxml qualifier
+on .xml/.rng. Don't jump to stage 2 before the trie lands.
+
+#### Smaller odds and ends
+
+- **`find_model_name` re-parses per rollout** - 2.6% self time; the
+  function regex-searches `child_source` for `_name`/`_inherit` once
+  per record emitted. Memoize by file inside `detect_rollouts`.
+- **Contextual regex alternative consolidation** - The 11-alt pattern
+  has `class`/`def`/`@` forms that share a `\bKEYWORD\s+` shape; could
+  be merged into one alternative with a non-capturing group. Cheap
+  experiment, measure before committing.
+- **Progress-bar GIL contention** - at `refresh_per_second=4` the
+  rich thread consumes ~1-3% CPU but contends for the GIL with the
+  main thread. A plain print-every-N-commits fallback when stderr is
+  a pipe or `--quiet` is set would remove it entirely.
