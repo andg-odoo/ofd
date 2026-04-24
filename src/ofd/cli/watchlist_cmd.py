@@ -16,6 +16,8 @@ import click
 from ofd import config as config_mod
 from ofd import watchlist as watchlist_mod
 from ofd.config import resolve_workspace
+from ofd.events.record import DEFINITION_KINDS
+from ofd.events.store import iter_repo, prune_orphan_rollouts
 
 
 @click.group("watchlist")
@@ -80,6 +82,67 @@ def remove(symbol: str, workspace_path: str | None):
     wl.remove(target)
     watchlist_mod.save(wl, workspace)
     click.echo(f"removed {target}")
+
+
+@watchlist_cli.command("rebuild")
+@click.option("--workspace", "workspace_path", default=None)
+def rebuild(workspace_path: str | None):
+    """Rebuild the watchlist from the existing raw event store.
+
+    Use after pulling code that adds new fields to `WatchlistEntry`
+    (e.g. the `element` field for RNG-scoped matching) - the raws
+    already carry the source data, so a full reindex isn't needed.
+    Manual pins are preserved; auto-extracted entries are recomputed.
+    """
+    workspace = resolve_workspace(workspace_path)
+    config = config_mod.load(workspace)
+
+    existing = watchlist_mod.load(workspace)
+    wl = watchlist_mod.Watchlist()
+    for entry in existing.manual_entries():
+        wl.entries[entry.symbol] = entry
+
+    seen = 0
+    for repo in config.repos:
+        for commit_record in iter_repo(workspace, repo.name):
+            for change in commit_record.changes:
+                if change.kind not in DEFINITION_KINDS:
+                    continue
+                seen += 1
+                wl.add_from_definition(
+                    change,
+                    repo=repo.name,
+                    sha=commit_record.commit.sha,
+                    committed_at=commit_record.commit.committed_at,
+                    active_version=config.active_version,
+                )
+
+    watchlist_mod.save(wl, workspace)
+    click.echo(
+        f"rebuilt watchlist: {len(wl.entries)} entries "
+        f"({len(existing.manual_entries())} manual preserved, "
+        f"{seen} definition events scanned)"
+    )
+
+    # Symbols that dropped out of the watchlist leave behind rollout
+    # events in the raw store. Those are false positives by definition
+    # (the symbol is no longer tracked), so drop them now - otherwise
+    # `ofd ledger update` will keep surfacing them as stub primitives.
+    live_symbols = set(wl.entries.keys())
+    total_rewritten = total_deleted = 0
+    for repo in config.repos:
+        r, d = prune_orphan_rollouts(workspace, repo.name, live_symbols)
+        total_rewritten += r
+        total_deleted += d
+    if total_rewritten or total_deleted:
+        click.echo(
+            f"pruned orphan rollouts: "
+            f"{total_rewritten} raw(s) rewritten, {total_deleted} deleted"
+        )
+
+    click.echo(
+        "run 'ofd ledger update' to refresh the ledger.", err=True,
+    )
 
 
 @watchlist_cli.command("list")

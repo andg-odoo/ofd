@@ -1,7 +1,13 @@
 from pathlib import Path
 
 from ofd.events.record import ChangeRecord, CommitEnvelope, CommitRecord, Kind
-from ofd.events.store import iter_repo, prune_before, read, write
+from ofd.events.store import (
+    iter_repo,
+    prune_before,
+    prune_orphan_rollouts,
+    read,
+    write,
+)
 
 
 def _envelope(sha: str = "abc123") -> CommitEnvelope:
@@ -106,6 +112,76 @@ def test_prune_before_skips_malformed_json(tmp_path: Path):
     # assume it's stale).
     deleted = prune_before(tmp_path, "odoo", "2025-09-01")
     assert deleted == 0
+
+
+def test_prune_orphan_rollouts_rewrites_and_deletes(tmp_path: Path):
+    """Rollouts for symbols not in `live_symbols` should be dropped.
+    If a file has no survivors, it's deleted outright."""
+    # Mixed raw: one definition + one live rollout + one orphan rollout.
+    keep_def = ChangeRecord(
+        kind=Kind.NEW_PUBLIC_CLASS,
+        file="odoo/orm/x.py", line=1,
+        symbol="odoo.orm.x.CachedModel",
+    )
+    live_rollout = ChangeRecord(
+        kind=Kind.ROLLOUT, file="a.py", line=1,
+        symbol="odoo.orm.x.CachedModel",
+    )
+    orphan = ChangeRecord(
+        kind=Kind.ROLLOUT, file="b.py", line=1,
+        symbol="odoo.fields.Integer",  # no longer tracked
+    )
+    write(tmp_path, CommitRecord(
+        commit=_envelope("mixed1"), changes=[keep_def, live_rollout, orphan],
+    ))
+    # Raw whose ONLY event is an orphan rollout - should be deleted.
+    write(tmp_path, CommitRecord(
+        commit=_envelope("orphan1"), changes=[
+            ChangeRecord(
+                kind=Kind.ROLLOUT, file="c.py", line=1,
+                symbol="odoo.fields.Integer",
+            ),
+        ],
+    ))
+    # Raw with only live events - untouched.
+    write(tmp_path, CommitRecord(
+        commit=_envelope("clean1"), changes=[keep_def],
+    ))
+
+    live_symbols = {"odoo.orm.x.CachedModel"}
+    rewritten, deleted = prune_orphan_rollouts(tmp_path, "odoo", live_symbols)
+    assert rewritten == 1
+    assert deleted == 1
+
+    # Mixed file should still exist without the orphan.
+    mixed = read(tmp_path, "odoo", "mixed1")
+    mixed_symbols = {c.symbol for c in mixed.changes}
+    assert mixed_symbols == {"odoo.orm.x.CachedModel"}
+    assert len(mixed.changes) == 2
+
+    # Orphan-only file should be gone.
+    assert not (tmp_path / "raw" / "odoo" / "orphan1.json").exists()
+    # Clean file should be untouched (left-alone returns no count).
+    assert (tmp_path / "raw" / "odoo" / "clean1.json").exists()
+
+
+def test_prune_orphan_rollouts_keeps_definitions(tmp_path: Path):
+    """Definitions aren't filtered by `live_symbols` - they're the
+    SOURCE of truth, not candidates for rollout-style matching."""
+    write(tmp_path, CommitRecord(
+        commit=_envelope("defonly"), changes=[
+            ChangeRecord(
+                kind=Kind.NEW_VIEW_ATTRIBUTE,
+                file="odoo/addons/base/rng/common.rng", line=1,
+                symbol="some.old.symbol.attr",  # not in live set
+                attribute="foo", element="bar",
+            ),
+        ],
+    ))
+    rewritten, deleted = prune_orphan_rollouts(tmp_path, "odoo", set())
+    assert rewritten == 0
+    assert deleted == 0
+    assert (tmp_path / "raw" / "odoo" / "defonly.json").exists()
 
 
 def test_omits_none_fields_in_serialized_output(tmp_path: Path):
