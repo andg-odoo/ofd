@@ -728,6 +728,7 @@ digest:
 
 ### 15.1 Python
 
+- `ast-grep-py >= 0.42` - rollout stage-2 structural qualifier
 - `click >= 8.1` - CLI
 - `lxml >= 5.0` - XML/RNG parsing
 - `pyahocorasick >= 2.1` - rollout pre-filter (multi-pattern scan)
@@ -858,6 +859,45 @@ the remaining lever.
   in `bench/golden.jsonl`). The remaining +11 us/entry slope is the
   per-present-short contextual regex - AC can't touch it; only the
   ast-grep qualifier (below) can.
+- **Stage-2 ast-grep qualifier** - DONE (2026-04-24). Tree-sitter
+  parse of each AC-surviving hunk's added blob, then `find_all` with
+  a kind-shaped rule confirms structural form. Two regimes:
+    - *Specific names* (most of the watchlist): the rule looks for any
+      `identifier` or `string_content` token equal to the name.
+      tree-sitter `comment` nodes don't tokenize their contents, so
+      this filters comment bleed-through (`# Query is deprecated`,
+      `:param ... Query parameters`) the regex couldn't see. Removed
+      5 known FPs.
+    - *Generic names in `_RELAX_GENERIC_KINDS`* (NEW_KWARG,
+      SIGNATURE_CHANGE, NEW_CLASS_ATTRIBUTE, NEW_PUBLIC_CLASS):
+      structural rule replaces the import-only gate the contextual
+      regex used to enforce. Picks up real kwarg adoptions
+      (`field.join(kind='LEFT JOIN')`) and signature overrides (`def
+      _field_to_sql(self, alias, fname, query=None)`) previously lost
+      to the import-statement requirement. Net +92 records on the
+      bench corpus, 0 drops vs the AC-era golden.
+    - *Generic names in NEW_DECORATOR_OR_HELPER* keep the import-only
+      gate. A generic helper name like `join` matches `",".join(items)`
+      everywhere; the qualifier can't structurally distinguish
+      `Many2many.join(...)` from `str.join(...)` without runtime types.
+  Tricks the rules rely on: tree-sitter parses `+    kind='lazy',`
+  (a single line of a multi-line call) as `assignment` with
+  `right.kind == expression_list` (the trailing comma turns the RHS
+  into an expression list); plain `kind = self._x()` parses as
+  `assignment` with `right.kind == call`. That fingerprint lets the
+  generic NEW_KWARG rule accept the multi-line-call fragment without
+  matching every random local-var assignment whose LHS happens to be
+  a generic word. ERROR-truncated hunks (broken signatures spanning
+  the hunk boundary) get a conservative fallback: if any ERROR child
+  contains an identifier matching the short name, the regex hit is
+  accepted - tree-sitter `find_all` doesn't descend into ERROR, and
+  we shouldn't regress vs the regex era on partial hunks. Cost: full
+  pass 54.1s -> 71.1s (+31%); per-hit cost grows at +40 us/entry
+  (vs +11 AC-era), the qualifier dominates that slope. Worth it for
+  the precision: structural confirmation kills the comment-noise
+  class entirely and unlocks ~12% more real catches on the corpus.
+  Bench harness in `bench/`, audit tool at `bench/audit_drops.py` for
+  diffing current vs golden by kind.
 - **`commit_diff_by_file` still per-commit** - ~2.5% of wall time now
   (was 20%+ before the bulk-info merge; git side is nearly free).
   Could still be folded into one `git log --patch` per repo if we
@@ -879,9 +919,13 @@ context on an added line?" which regex handles correctly. That said,
 there are real accuracy limits we accept today:
 
 - **Import aliasing** - `from .models import CachedModel as CM; class
-  Foo(CM)` is a rollout that we miss.
-- **Docstring / comment / string-literal noise** - `CachedModel`
-  mentioned in a docstring or log message counts as a rollout.
+  Foo(CM)` is a rollout that we miss. Still open after the ast-grep
+  qualifier: matching the alias would need cross-statement reference
+  resolution.
+- ~~**Docstring / comment / string-literal noise**~~ - resolved by the
+  stage-2 ast-grep qualifier; tree-sitter's `comment` nodes don't
+  tokenize identifiers, so a `CachedModel` mention in a docstring or
+  comment no longer fires as a rollout.
 - **Nested XML element scope** - the `widget.invisible` fix works for
   inline `<widget invisible="x"/>` but fails on
   `<widget><tooltip invisible="x"/></widget>` where `invisible`
@@ -905,11 +949,11 @@ move is a two-stage matcher: fast trie screen → per-file AST qualifier.
   `ast` + `ast-grep` cover the languages we care about without adding
   a heavier dep.
 
-Order of operations: ~~trie~~ (done) → (measure correctness
-complaints) → ast-grep qualifier on .py → lxml qualifier on .xml/.rng.
-The bench harness in `bench/` gates any future swap on exact parity
-against the regex-era golden, so a stage-2 qualifier that intentionally
-shrinks the false-positive set will need a `--update-golden` step.
+Order of operations: ~~trie~~ (done) → ~~ast-grep qualifier on .py~~
+(done) → lxml qualifier on .xml/.rng. The bench harness in `bench/`
+gates any future swap on exact parity against the prior golden;
+`bench/audit_drops.py` buckets adds/drops by entry kind for fast
+review, and `--update-golden` rewrites once the diff is approved.
 
 #### Smaller odds and ends
 
