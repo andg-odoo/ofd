@@ -23,6 +23,7 @@ from ofd import watchlist as watchlist_mod
 from ofd.config import Config, RepoConfig
 from ofd.events.record import ChangeRecord, CommitEnvelope, CommitRecord
 from ofd.events.store import raw_path, write as write_record
+from ofd.extractors import context_keys
 from ofd.extractors.dispatcher import extract_for_file
 from ofd.globs import match_any
 from ofd.release_detect import detect_version, is_release_file
@@ -150,6 +151,28 @@ def process_commit(
         records = extract_for_file(parent_src, child_src, file)
         changes.extend(records)
 
+    # --- stage 1.5: wide-scope extractors (context keys) ---
+    # `@api.depends_context(...)` decorators almost always live in
+    # addons (outside framework_paths), so we run a needle-gated wide
+    # scan: pull the commit diff once, look for files whose patch
+    # mentions `depends_context`, fetch parent/child source for those
+    # only. The `all_patches` value is reused by stage 3.
+    all_patches: dict[str, str] | None = None
+    py_files = [f for f in all_files if f.endswith(".py")]
+    if py_files:
+        all_patches = gitio.commit_diff_by_file(repo.mirror, sha)
+        for file in py_files:
+            patch = all_patches.get(file, "")
+            if "depends_context" not in patch:
+                continue
+            if file in child_sources:
+                child_src = child_sources[file]
+            else:
+                child_src = _fetch(sha, file)
+                child_sources[file] = child_src
+            parent_src = _fetch(f"{sha}^", file)
+            changes.extend(context_keys.extract(parent_src, child_src, file))
+
     # --- stage 2: watchlist update (before rollout scan) ---
     for record in changes:
         watchlist.add_from_definition(
@@ -162,8 +185,8 @@ def process_commit(
 
     # --- stage 3: rollout scan over all changed files ---
     if watchlist.short_names():
-        # One git call to get the whole commit's diff, split client-side.
-        all_patches = gitio.commit_diff_by_file(repo.mirror, sha)
+        if all_patches is None:
+            all_patches = gitio.commit_diff_by_file(repo.mirror, sha)
         non_gated = [f for f in all_files if f not in gated_files]
         patches = {
             file: all_patches[file]
