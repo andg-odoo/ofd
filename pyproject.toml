@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Odoo Framework Digest"
 requires-python = ">=3.11"
 dependencies = [
+    "ast-grep-py>=0.42",
     "click>=8.1",
     "lxml>=5.0",
     "pyahocorasick>=2.1",

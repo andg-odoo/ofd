@@ -8,3 +8,4 @@ build/
 dist/
 bench/corpus.pkl
 bench/*.log
+.claude/

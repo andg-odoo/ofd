@@ -6,17 +6,37 @@ capture the surrounding before/after snippet so stage-3 gets a ready
 slide example.
 
 A naive `short_name in line` match produces huge false-positive rates
-for generic names like `join`, `default`, `help`. To compensate:
+for generic names like `join`, `default`, `help`. The pipeline applies
+three filtering stages, in order:
 
-- Each short name is compiled into a *context-aware* regex that only
-  matches when the identifier appears in a syntactic position that
-  implies it's being *used* (attribute access, call, kwarg, import),
-  not embedded in a string literal or comment.
+1. Aho-Corasick prefilter (`_Matcher.automaton`). One pass over the
+   patch reports which watchlisted short names are present. Replaces
+   both the file-level `\\b(a|b|...)\\b` regex screen and the per-entry
+   `short in added_blob` substring loop. Single shared automaton across
+   the whole watchlist - cost is flat in N.
 
-- Names in `_GENERIC_SHORT_NAMES` require an explicit `from ... import`
-  of the name; they're too ambiguous otherwise (e.g. a new `.join()`
-  method on a relational field would collide with every `",".join(...)`
-  in the codebase).
+2. Contextual regex (`_contextual_pattern`). Per-entry pattern that
+   only matches when the identifier appears in a syntactic position
+   implying *use* (attribute, call, kwarg, import, class, def,
+   decorator, annotation, quoted string). Filters out comments and
+   string-literal noise the AC pass can't see.
+
+3. ast-grep structural qualifier (`_ast_qualifies`, `.py` files only).
+   For specific names: tree-sitter parse confirms an actual identifier
+   or quoted-string token of the name exists (kills the residual
+   comment bleed-through the regex misses, e.g. `# Query is
+   deprecated`). For generic names (`_GENERIC_SHORT_NAMES`) on kinds
+   in `_RELAX_GENERIC_KINDS`, applies a stricter kind-shaped rule
+   (kwarg position, parameter form, class-body assignment, etc.) -
+   precise enough to replace the import-only gate the contextual
+   regex used to enforce, unlocking real adoptions previously hidden
+   behind it.
+
+Generic names in kinds NOT in `_RELAX_GENERIC_KINDS` (notably
+NEW_DECORATOR_OR_HELPER) keep the import-only gate: a generic helper
+name like `join` matches `",".join(items)` everywhere, and the
+qualifier can't structurally distinguish `Many2many.join(...)` from
+`str.join(...)` without runtime type info.
 """
 
 from __future__ import annotations
@@ -26,6 +46,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 import ahocorasick
+from ast_grep_py import SgRoot
 
 from ofd.events.record import ChangeRecord, Kind
 from ofd.watchlist import Watchlist
@@ -42,6 +63,30 @@ _FILE_HEADER = re.compile(r"^\+\+\+ b/(.+)$")
 _CLASS_LINE = re.compile(r"^\s*class\s+(\w+)")
 _MODEL_ATTR = re.compile(r"""_name\s*=\s*['"]([^'"]+)['"]""")
 _INHERIT_ATTR = re.compile(r"""_inherit\s*=\s*['"]([^'"]+)['"]""")
+
+# Kinds where the ast-grep qualifier provides enough structural
+# discrimination to drop the import-only gate for generic short names.
+# NEW_DECORATOR_OR_HELPER is excluded: a generic helper name like `join`
+# matches `",".join(items)` everywhere, and the qualifier can't tell
+# `Many2many.join(...)` from `str.join(...)` without runtime type info.
+_RELAX_GENERIC_KINDS = frozenset({
+    Kind.NEW_KWARG,
+    Kind.SIGNATURE_CHANGE,
+    Kind.NEW_CLASS_ATTRIBUTE,
+    Kind.NEW_PUBLIC_CLASS,
+})
+
+# Kinds whose adoption shape is Python-only - matching them in XML/RNG
+# files is a pure error mode (a NEW_KWARG entry like `Many2one.join.kind`
+# is not an XML attribute, even if a `<button kind="primary"/>` happens
+# to share the short name).
+_PYTHON_ONLY_KINDS = frozenset({
+    Kind.NEW_PUBLIC_CLASS,
+    Kind.NEW_DECORATOR_OR_HELPER,
+    Kind.NEW_CLASS_ATTRIBUTE,
+    Kind.NEW_KWARG,
+    Kind.SIGNATURE_CHANGE,
+})
 
 # Names that alias too many unrelated builtins / common idioms to be
 # matched outside an explicit import. Hand-curated; extend cautiously.
@@ -87,8 +132,17 @@ def _contextual_pattern(
         Skips the Python-specific alternatives entirely, cutting regex
         cost ~6x per call on XML blobs in benchmarks.
 
-    For generic names (`_GENERIC_SHORT_NAMES`), restrict to import only -
-    anything else is too noisy.
+    Generic names (`_GENERIC_SHORT_NAMES`) used to be restricted to
+    *import* statements only - the regex on its own can't tell `kind=lazy`
+    (a real kwarg adoption) from `kind = self._compute_kind()` (random
+    local var). With `file_scope == "py"`, the structural ast-grep
+    qualifier in `_ast_qualifies` handles that disambiguation, so the
+    regex runs the full pattern and the qualifier filters.
+
+    For `file_scope == "py_other"` (.js, .po, .csv, .html, ...) the
+    qualifier can't help (we only parse Python), so we keep the
+    import-only gate. Without it, a .po file containing English text
+    like `msgid "kind of weird"` matches every generic name.
 
     If `element` is given (RNG-derived view-attribute entry), restrict
     matches to XML attributes on that specific parent element. Without
@@ -102,21 +156,9 @@ def _contextual_pattern(
         # current opening tag (can't cross into a child element) and
         # naturally covers newlines for multi-line tags.
         return re.compile(rf"<{el_escaped}\b[^<]*?\b{escaped}\s*=")
-    if file_scope == "xml":
-        # XML / RNG / view files skip most Python forms but keep the
-        # ones that legitimately appear in QWeb: quoted strings (`<field
-        # name="foo"/>`), attribute assignment (`invisible="1"`), and
-        # attribute access (`t-att-foo="record.bar"` reads `.bar` as a
-        # rollout). ~5x cheaper per call than the full 11-alt pattern.
-        return re.compile(
-            rf"'{escaped}'|\"{escaped}\"|\b{escaped}\s*=(?!=)|\.{escaped}\b"
-        )
-    if name in _GENERIC_SHORT_NAMES:
-        # Only match if the watchlisted name shows up in an explicit
-        # import. If we know the defining module, prefer its own import.
-        # Non-greedy filler + line-anchored `^\s*from`/`^\s*import` to
-        # avoid catastrophic backtracking on long strings containing
-        # the word "import".
+    if file_scope == "py_other" and name in _GENERIC_SHORT_NAMES:
+        # No structural qualifier on non-.py files; preserve the
+        # import-only restriction the regex era relied on.
         if module_path:
             mod_escaped = re.escape(module_path)
             return re.compile(
@@ -128,6 +170,15 @@ def _contextual_pattern(
             rf"(?:^\s*from\s+\S+\s+import\s+[^#\n]*?\b{escaped}\b)"
             rf"|(?:^\s*import\s+[^#\n]*?\b{escaped}\b)",
             re.MULTILINE,
+        )
+    if file_scope == "xml":
+        # XML / RNG / view files skip most Python forms but keep the
+        # ones that legitimately appear in QWeb: quoted strings (`<field
+        # name="foo"/>`), attribute assignment (`invisible="1"`), and
+        # attribute access (`t-att-foo="record.bar"` reads `.bar` as a
+        # rollout). ~5x cheaper per call than the full 11-alt pattern.
+        return re.compile(
+            rf"'{escaped}'|\"{escaped}\"|\b{escaped}\s*=(?!=)|\.{escaped}\b"
         )
     # re.MULTILINE + `^\s*` anchors the import alternatives to actual
     # statement lines. Without it, `import` mentioned inside a string
@@ -261,6 +312,140 @@ def _module_path_of(symbol: str) -> str | None:
     return ".".join(segments[:-1]) if segments[-1][:1].isupper() else ".".join(segments[:-2])
 
 
+@lru_cache(maxsize=2048)
+def _specific_rule(name: str) -> dict:
+    """Confirm `name` appears as an actual identifier or quoted-string
+    token in the parsed tree.
+
+    For specific (non-generic) names this is sufficient: tree-sitter's
+    `comment` nodes don't tokenize their contents into identifiers, so
+    a comment like `# Query is deprecated` contributes no `identifier:
+    Query` node and won't match. Quoted-string adoptions (context keys,
+    magic strings - common for `manual` watchlist entries) show up as
+    `string_content` and are accepted here.
+    """
+    name_re = f"^{re.escape(name)}$"
+    return {"rule": {"any": [
+        {"kind": "identifier", "regex": name_re},
+        {"kind": "string_content", "regex": name_re},
+    ]}}
+
+
+@lru_cache(maxsize=512)
+def _strict_generic_rule(kind: Kind, name: str) -> dict | None:
+    """Strict structural rule for generic short names (`kind`, `default`,
+    `table`, etc.). The contextual regex restricts these to *imports*
+    today, which throws away most real adoptions. The structural rule
+    is precise enough to replace that gate without flooding FPs.
+    """
+    name_re = f"^{re.escape(name)}$"
+    if kind in (Kind.NEW_KWARG, Kind.SIGNATURE_CHANGE):
+        return {"rule": {"any": [
+            # Call-site: foo(name=...)
+            {"kind": "keyword_argument",
+             "has": {"field": "name", "regex": name_re, "stopBy": "end"}},
+            # Multi-line call: a `+    name=value,` line by itself parses
+            # as an assignment whose right field is an `expression_list`
+            # (the trailing comma turns the RHS into a singleton tuple
+            # syntactically). A plain `name = SQL(...)` local-var
+            # assignment has `right.kind == call/identifier/...`, never
+            # `expression_list` - so this fingerprint distinguishes the
+            # kwarg-fragment case from random local-var assignments
+            # whose LHS happens to be a generic word.
+            {"all": [
+                {"kind": "assignment"},
+                {"has": {"field": "left", "kind": "identifier",
+                         "regex": name_re, "stopBy": "end"}},
+                {"has": {"field": "right", "kind": "expression_list",
+                         "stopBy": "end"}},
+            ]},
+            # Def-site parameter, four shapes.
+            {"kind": "default_parameter",
+             "has": {"field": "name", "regex": name_re, "stopBy": "end"}},
+            {"kind": "typed_default_parameter",
+             "has": {"field": "name", "regex": name_re, "stopBy": "end"}},
+            {"kind": "typed_parameter",
+             "has": {"kind": "identifier", "regex": name_re, "stopBy": "end"}},
+            {"kind": "identifier", "regex": name_re,
+             "inside": {"kind": "parameters", "stopBy": "end"}},
+        ]}}
+    if kind is Kind.NEW_CLASS_ATTRIBUTE:
+        return {"rule": {"any": [
+            # Subclass-body assignment (also catches the multi-line-call
+            # form, same shape).
+            {"kind": "assignment",
+             "has": {"field": "left", "kind": "identifier",
+                     "regex": name_re, "stopBy": "end"}},
+            # Attribute access: obj.kind / cls.kind
+            {"kind": "attribute",
+             "has": {"field": "attribute", "regex": name_re, "stopBy": "end"}},
+        ]}}
+    if kind is Kind.NEW_PUBLIC_CLASS:
+        return {"rule": {"any": [
+            {"kind": "call",
+             "has": {"field": "function", "regex": name_re, "stopBy": "end"}},
+            {"kind": "attribute",
+             "has": {"field": "attribute", "regex": name_re, "stopBy": "end"}},
+            {"kind": "identifier", "regex": name_re,
+             "inside": {"kind": "argument_list",
+                        "inside": {"kind": "class_definition", "stopBy": "end"},
+                        "stopBy": "end"}},
+            {"kind": "dotted_name", "regex": name_re,
+             "inside": {"kind": "import_from_statement", "stopBy": "end"}},
+        ]}}
+    if kind is Kind.NEW_DECORATOR_OR_HELPER:
+        return {"rule": {"any": [
+            {"kind": "decorator", "any": [
+                {"has": {"kind": "identifier", "regex": name_re, "stopBy": "end"}},
+                {"has": {"kind": "call",
+                         "has": {"field": "function", "regex": name_re, "stopBy": "end"},
+                         "stopBy": "end"}},
+            ]},
+            {"kind": "call",
+             "has": {"field": "function", "regex": name_re, "stopBy": "end"}},
+            {"kind": "attribute",
+             "has": {"field": "attribute", "regex": name_re, "stopBy": "end"}},
+            {"kind": "dotted_name", "regex": name_re,
+             "inside": {"kind": "import_from_statement", "stopBy": "end"}},
+        ]}}
+    return None
+
+
+def _has_truncated_identifier(root, name: str) -> bool:
+    """When tree-sitter wraps a partial construct in ERROR, find_all skips
+    the children. If the broken span contains an identifier matching `name`,
+    we can't structurally qualify - accept conservatively rather than emit
+    a false negative the regex era didn't have.
+    """
+    for child in root.children():
+        if child.kind() != "ERROR":
+            continue
+        for sub in child.children():
+            if sub.kind() == "identifier" and sub.text() == name:
+                return True
+    return False
+
+
+def _ast_qualifies(root, kind: Kind, name: str) -> bool:
+    """Stage-2 structural confirmation for a regex-detected rollout.
+
+    Specific names (most of the watchlist) just need a comment-safe
+    sanity check - any identifier or quoted-string match suffices. Generic
+    names (`_GENERIC_SHORT_NAMES`) get a kind-specific structural rule,
+    which is what makes loosening the import-only gate safe.
+    """
+    if name in _GENERIC_SHORT_NAMES:
+        rule = _strict_generic_rule(kind, name)
+        if rule is None:
+            return True  # no structural shape known: accept regex hit
+        if root.find_all(rule):
+            return True
+        return _has_truncated_identifier(root, name)
+    if root.find_all(_specific_rule(name)):
+        return True
+    return _has_truncated_identifier(root, name)
+
+
 @dataclass(frozen=True)
 class _Matcher:
     """Pre-built rollout matcher for a given watchlist snapshot.
@@ -287,10 +472,18 @@ class _Matcher:
 
 def _file_scope(path: str) -> str:
     """Pick the narrowest contextual-pattern scope that still covers
-    the adoption shapes we care about in this file type."""
+    the adoption shapes we care about in this file type.
+
+    `.py` files get the relaxed pattern (qualifier filters generic-name
+    noise downstream). Other py-shaped files (.js, .po, .csv, .html,
+    ...) get `py_other` which keeps the import-only generic-name gate -
+    the qualifier only parses Python and can't help here.
+    """
     if path.endswith((".xml", ".rng")):
         return "xml"
-    return "py"
+    if path.endswith(".py"):
+        return "py"
+    return "py_other"
 
 
 def _build_matcher(watchlist: Watchlist) -> _Matcher:
@@ -298,13 +491,22 @@ def _build_matcher(watchlist: Watchlist) -> _Matcher:
     for entry in sorted(watchlist.entries.values(), key=lambda e: e.symbol):
         by_short.setdefault(entry.short_name, []).append(entry)
     compiled_by_scope: dict[str, dict[str, re.Pattern[str]]] = {
-        "py": {}, "xml": {},
+        "py": {}, "py_other": {}, "xml": {},
     }
     for entry in watchlist.entries.values():
         module = _module_path_of(entry.symbol)
-        for scope in ("py", "xml"):
+        # Generic-named entries whose kind has no discriminating qualifier
+        # rule (e.g. NEW_DECORATOR_OR_HELPER `join`) keep the import-only
+        # gate even on .py files - the qualifier would let every
+        # `",".join(items)` through.
+        keep_strict_on_py = (
+            entry.short_name in _GENERIC_SHORT_NAMES
+            and entry.kind not in _RELAX_GENERIC_KINDS
+        )
+        for scope in ("py", "py_other", "xml"):
+            effective = "py_other" if (scope == "py" and keep_strict_on_py) else scope
             compiled_by_scope[scope][entry.symbol] = _contextual_pattern(
-                entry.short_name, module, entry.element, scope,
+                entry.short_name, module, entry.element, effective,
             )
     automaton = ahocorasick.Automaton()
     for short in by_short:
@@ -386,7 +588,10 @@ def detect_rollouts(
         # cost is gone.
         if next(automaton.iter(patch), None) is None:
             continue
-        compiled = matcher.compiled_by_scope[_file_scope(file)]
+        scope = _file_scope(file)
+        compiled = matcher.compiled_by_scope[scope]
+        is_py = file.endswith(".py")
+        is_xml = scope == "xml"
         for hunk in _parse_patch(patch):
             added_blob = _strip_comments("\n".join(hunk.raw_added))
             if not added_blob.strip():
@@ -408,24 +613,57 @@ def detect_rollouts(
             present_shorts = {value for _, value in automaton.iter(added_blob)}
             if not present_shorts:
                 continue
+            # Parse the added blob once per hunk so the .py qualifier can
+            # share a single tree-sitter pass across every candidate entry
+            # below. Lazy: only built when a qualifier actually needs it.
+            ast_root = None
             for short, group in by_short.items():
                 if short not in present_shorts:
                     continue
+                # On XML/RNG files, drop Python-only kinds with *generic*
+                # short names. A `Many2one.join.kind` (NEW_KWARG, generic
+                # `kind`) was firing on `<button kind="primary"/>` and
+                # similar - the kwarg shape simply doesn't exist in XML.
+                # Specific names (`formatted_display_name`, `CachedModel`)
+                # legitimately appear as XML attribute values / template
+                # references, so we keep them.
+                if is_xml:
+                    group = [
+                        e for e in group
+                        if not (
+                            e.kind in _PYTHON_ONLY_KINDS
+                            and e.short_name in _GENERIC_SHORT_NAMES
+                        )
+                    ]
+                    if not group:
+                        continue
                 if any(e.element is not None for e in group):
                     # Per-entry matching: each entry's pattern is
                     # context-specific (parent element differs), so a
                     # match on one entry doesn't imply a match on the
                     # others. Emit per matching entry.
                     for entry in group:
-                        if compiled[entry.symbol].search(added_blob):
-                            records.append(_make_record(file, hunk, entry))
+                        if not compiled[entry.symbol].search(added_blob):
+                            continue
+                        if is_py:
+                            if ast_root is None:
+                                ast_root = SgRoot(added_blob, "python").root()
+                            if not _ast_qualifies(ast_root, entry.kind, entry.short_name):
+                                continue
+                        records.append(_make_record(file, hunk, entry))
                 else:
                     # Shared short name, no element context -> all
                     # entries use the identical pattern. Legacy dedup:
                     # one rollout per hunk, attributed to the first.
                     first = group[0]
-                    if compiled[first.symbol].search(added_blob):
-                        records.append(_make_record(file, hunk, first))
+                    if not compiled[first.symbol].search(added_blob):
+                        continue
+                    if is_py:
+                        if ast_root is None:
+                            ast_root = SgRoot(added_blob, "python").root()
+                        if not _ast_qualifies(ast_root, first.kind, first.short_name):
+                            continue
+                    records.append(_make_record(file, hunk, first))
     return records
 
 
