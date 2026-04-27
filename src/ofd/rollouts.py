@@ -469,18 +469,114 @@ def _has_truncated_identifier(root, name: str) -> bool:
 def _context_key_rule(name: str) -> dict:
     """Strict structural rule for NEW_CONTEXT_KEY adoption.
 
-    Accepts the kwarg form (`with_context(NAME=value)`) and any quoted
-    string with the key text (`env.context['NAME']`, `('NAME',)` in
-    `_depends_context`, `@api.depends_context('NAME')` redeclarations).
-    Rejects attribute access and bare-identifier reads, which are the
-    model-field-name and local-var collisions that drove the
-    `context_key.employee_id`/`context_key.company` FPs.
+    Many context keys collide with model-field names (`employee_id`,
+    `partner_id`, `company`, ...). The previous "any kwarg or any
+    string_content" rule still misfired on `_create(partner_id=...)`
+    method-call kwargs and `{'partner_id': line.x}` dict-literal keys
+    that happen to share the name. This rule restricts to five
+    canonical adoption shapes that have a structural anchor tying
+    the string/kwarg to context machinery:
+
+      1. `obj.with_context(NAME=val)` / `with_company(NAME=val)` -
+         kwarg in a `with_*` call (the standard env-mutation idiom).
+      2. `env.context['NAME']` - subscript on `.context` attribute.
+      3. `*.context.get/pop/setdefault('NAME', ...)` - dict-method
+         lookup on `.context`.
+      4. `_depends_context = ('NAME', ...)` - the class-attr tuple
+         declaring context dependencies.
+      5. `@api.depends_context('NAME', ...)` - decorator-call form
+         (covers redeclarations of the same key in subclasses).
+
+    Everything else - dict pairs, domain tuples, list elements,
+    plain method-call kwargs - is rejected. False negatives are
+    bounded: an unusual idiom isn't caught, but a watchlist entry
+    that legitimately fires here is also rare.
     """
     name_re = f"^{re.escape(name)}$"
     return {"rule": {"any": [
+        # 1. with_*(NAME=...)
         {"kind": "keyword_argument",
-         "has": {"field": "name", "regex": name_re, "stopBy": "end"}},
-        {"kind": "string_content", "regex": name_re},
+         "all": [
+             {"has": {"field": "name", "regex": name_re, "stopBy": "end"}},
+             {"inside": {
+                 "kind": "call",
+                 "has": {"field": "function",
+                         "any": [
+                             {"kind": "identifier", "regex": "^with_"},
+                             {"kind": "attribute",
+                              "has": {"field": "attribute", "regex": "^with_",
+                                      "stopBy": "end"}},
+                         ],
+                         "stopBy": "end"},
+                 "stopBy": "end",
+             }},
+         ]},
+        # 2. env.context['NAME']
+        {"kind": "string_content", "regex": name_re,
+         "inside": {
+             "kind": "subscript",
+             "has": {"field": "value",
+                     "any": [
+                         {"kind": "attribute",
+                          "has": {"field": "attribute", "regex": "^context$",
+                                  "stopBy": "end"}},
+                         {"kind": "identifier", "regex": "^context$"},
+                     ],
+                     "stopBy": "end"},
+             "stopBy": "end",
+         }},
+        # 3. *.context.get/pop/setdefault('NAME', ...)
+        {"kind": "string_content", "regex": name_re,
+         "inside": {
+             "kind": "call",
+             "has": {"field": "function",
+                     "kind": "attribute",
+                     "all": [
+                         {"has": {"field": "attribute",
+                                  "regex": "^(get|pop|setdefault)$",
+                                  "stopBy": "end"}},
+                         {"has": {"field": "object",
+                                  "any": [
+                                      {"kind": "attribute",
+                                       "has": {"field": "attribute",
+                                               "regex": "^context$",
+                                               "stopBy": "end"}},
+                                      {"kind": "identifier",
+                                       "regex": "^context$"},
+                                  ],
+                                  "stopBy": "end"}},
+                     ],
+                     "stopBy": "end"},
+             "stopBy": "end",
+         }},
+        # 4. _depends_context = (...)
+        {"kind": "string_content", "regex": name_re,
+         "inside": {
+             "kind": "assignment",
+             "has": {"field": "left", "kind": "identifier",
+                     "regex": "^_(depends_context|context_keys|context_dependent)$",
+                     "stopBy": "end"},
+             "stopBy": "end",
+         }},
+        # 5. @*depends_context('NAME', ...)
+        {"kind": "string_content", "regex": name_re,
+         "inside": {
+             "kind": "call",
+             "all": [
+                 {"has": {"field": "function",
+                          "any": [
+                              {"kind": "identifier",
+                               "regex": "^depends_context$"},
+                              {"kind": "attribute",
+                               "has": {"field": "attribute",
+                                       "regex": "^depends_context$",
+                                       "stopBy": "end"}},
+                          ],
+                          "stopBy": "end"}},
+                 {"inside": {"kind": "decorator", "stopBy": "end"}},
+             ],
+             "stopBy": "end",
+         }},
     ]}}
 
 
@@ -494,9 +590,14 @@ def _ast_qualifies(root, kind: Kind, name: str) -> bool:
     (`_GENERIC_SHORT_NAMES`) get a kind-specific structural rule.
     """
     if kind is Kind.NEW_CONTEXT_KEY:
-        if root.find_all(_context_key_rule(name)):
-            return True
-        return _has_truncated_identifier(root, name)
+        # No truncation fallback: the ERROR-node identifier check
+        # accepts any bare-identifier presence, which is exactly the
+        # FP class we're guarding against (model-field-name collisions).
+        # A truncated hunk that genuinely contains a context-key adoption
+        # will reparse cleanly under one of the five accepted shapes once
+        # the surrounding code lands; we'd rather miss the partial-hunk
+        # case than let `company = self.env['res.company']` through.
+        return bool(root.find_all(_context_key_rule(name)))
     if name in _GENERIC_SHORT_NAMES:
         rule = _strict_generic_rule(kind, name)
         if rule is None:

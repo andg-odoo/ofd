@@ -98,6 +98,14 @@ def _depends_context_keys(source: str | None) -> dict[str, int]:
     return out
 
 
+def _is_default_field_key(key: str) -> bool:
+    """`default_<field>` is Odoo's mechanical convention for setting
+    field defaults via context (any field on the target model can be
+    pre-filled this way). It's a well-defined schema, not a primitive
+    worth tracking - skip these at extraction time."""
+    return key.startswith("default_")
+
+
 def extract(
     parent_source: str | None,
     child_source: str | None,
@@ -106,7 +114,10 @@ def extract(
     """Emit one record per context key newly introduced in this file."""
     parent_keys = _depends_context_keys(parent_source)
     child_keys = _depends_context_keys(child_source)
-    new_keys = sorted(child_keys.keys() - parent_keys.keys())
+    new_keys = sorted(
+        k for k in (child_keys.keys() - parent_keys.keys())
+        if not _is_default_field_key(k)
+    )
     return [
         ChangeRecord(
             # NEW_CONTEXT_KEY is a Python-only kind at the rollout
