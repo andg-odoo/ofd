@@ -88,6 +88,16 @@ _PYTHON_ONLY_KINDS = frozenset({
     Kind.SIGNATURE_CHANGE,
 })
 
+# Kinds skipped in XML scope for *every* short name, generic or specific.
+# Most context keys (`employee_id`, `partner_id`, `company`, `lang`, ...)
+# share names with Odoo model fields, and XML views reference fields by
+# name (`<field name="employee_id"/>`). The rollout regex's
+# quoted-string alternative can't distinguish "context-key reference"
+# from "field name", so the only safe XML behavior is to skip entirely.
+_XML_BLOCKLIST_KINDS = frozenset({
+    Kind.NEW_CONTEXT_KEY,
+})
+
 # Names that alias too many unrelated builtins / common idioms to be
 # matched outside an explicit import. Hand-curated; extend cautiously.
 _GENERIC_SHORT_NAMES: frozenset[str] = frozenset({
@@ -620,17 +630,24 @@ def detect_rollouts(
             for short, group in by_short.items():
                 if short not in present_shorts:
                     continue
-                # On XML/RNG files, drop Python-only kinds with *generic*
-                # short names. A `Many2one.join.kind` (NEW_KWARG, generic
-                # `kind`) was firing on `<button kind="primary"/>` and
-                # similar - the kwarg shape simply doesn't exist in XML.
-                # Specific names (`formatted_display_name`, `CachedModel`)
-                # legitimately appear as XML attribute values / template
-                # references, so we keep them.
+                # On XML/RNG files, drop:
+                #   - Python-only kinds with generic short names
+                #     (NEW_KWARG `kind` was firing on
+                #     `<button kind="primary"/>`)
+                #   - any kind in the XML blocklist (currently
+                #     NEW_CONTEXT_KEY: most context keys share names
+                #     with model fields, so `<field name="employee_id"/>`
+                #     is a model-field reference, not a context-key
+                #     adoption - the regex can't tell them apart)
+                # Specific names in other Python-only kinds
+                # (`formatted_display_name` magic strings,
+                # `CachedModel` class refs) legitimately appear as XML
+                # attribute values / template references, so they stay.
                 if is_xml:
                     group = [
                         e for e in group
-                        if not (
+                        if e.kind not in _XML_BLOCKLIST_KINDS
+                        and not (
                             e.kind in _PYTHON_ONLY_KINDS
                             and e.short_name in _GENERIC_SHORT_NAMES
                         )

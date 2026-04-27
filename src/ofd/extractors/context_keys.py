@@ -109,13 +109,16 @@ def extract(
     new_keys = sorted(child_keys.keys() - parent_keys.keys())
     return [
         ChangeRecord(
-            # NEW_DECORATOR_OR_HELPER mirrors the convention
-            # `watchlist.add_manual` uses for context-key pins, so
-            # the rollout matcher's specific-name path (identifier OR
-            # string_content match) handles the adoption shape
-            # (`'formatted_display_name'` literal, kwarg form, etc.)
-            # without a new schema kind.
-            kind=Kind.NEW_DECORATOR_OR_HELPER,
+            # NEW_CONTEXT_KEY is a Python-only kind at the rollout
+            # layer. Many context keys share names with model fields
+            # (`employee_id`, `partner_id`, `company`, `lang`, ...) and
+            # XML view definitions reference those fields by name -
+            # `<field name="employee_id"/>` is a model-field reference,
+            # not a context-key adoption, but the rollout regex's
+            # quoted-string alternative can't tell them apart. The
+            # matcher skips XML scope for this kind to avoid the FP
+            # storm.
+            kind=Kind.NEW_CONTEXT_KEY,
             file=file,
             line=child_keys[key],
             symbol=f"context_key.{key}",
