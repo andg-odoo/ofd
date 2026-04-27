@@ -125,6 +125,35 @@ _GENERIC_SHORT_NAMES: frozenset[str] = frozenset({
 })
 
 
+@lru_cache(maxsize=512)
+def _context_key_pattern(name: str) -> re.Pattern[str]:
+    """Tighter pattern for NEW_CONTEXT_KEY adoption.
+
+    Most context keys share names with Odoo model fields (`employee_id`,
+    `partner_id`, `company`, ...) and the broad py-scope contextual
+    pattern's `\\.NAME\\b` alternative was matching every `obj.company`,
+    `record.employee_id`, `self.env.company` attribute access -
+    unrelated model fields, not context-key adoptions. Restrict to
+    the canonical context-key shapes:
+
+      - quoted string `'NAME'` / `"NAME"` (covers `env.context['NAME']`,
+        `env.context.get('NAME')`, `_depends_context = ('NAME',)`,
+        `@api.depends_context('NAME')` re-declarations)
+      - kwarg-style `NAME=` (covers `with_context(NAME=value)` plus
+        local-var assignments which the .py qualifier filters out)
+
+    Same pattern across all file scopes - .xml entries are dropped at
+    the matcher level by `_XML_BLOCKLIST_KINDS`, .py and .py_other use
+    this pattern; .py also runs the ast-grep qualifier which rejects
+    bare-attribute and identifier matches structurally.
+    """
+    n = re.escape(name)
+    return re.compile(
+        rf"(?:'{n}')|(?:\"{n}\")|(?:\b{n}\s*=(?!=))",
+        re.MULTILINE,
+    )
+
+
 @lru_cache(maxsize=1024)
 def _contextual_pattern(
     name: str,
@@ -436,14 +465,38 @@ def _has_truncated_identifier(root, name: str) -> bool:
     return False
 
 
+@lru_cache(maxsize=1024)
+def _context_key_rule(name: str) -> dict:
+    """Strict structural rule for NEW_CONTEXT_KEY adoption.
+
+    Accepts the kwarg form (`with_context(NAME=value)`) and any quoted
+    string with the key text (`env.context['NAME']`, `('NAME',)` in
+    `_depends_context`, `@api.depends_context('NAME')` redeclarations).
+    Rejects attribute access and bare-identifier reads, which are the
+    model-field-name and local-var collisions that drove the
+    `context_key.employee_id`/`context_key.company` FPs.
+    """
+    name_re = f"^{re.escape(name)}$"
+    return {"rule": {"any": [
+        {"kind": "keyword_argument",
+         "has": {"field": "name", "regex": name_re, "stopBy": "end"}},
+        {"kind": "string_content", "regex": name_re},
+    ]}}
+
+
 def _ast_qualifies(root, kind: Kind, name: str) -> bool:
     """Stage-2 structural confirmation for a regex-detected rollout.
 
-    Specific names (most of the watchlist) just need a comment-safe
-    sanity check - any identifier or quoted-string match suffices. Generic
-    names (`_GENERIC_SHORT_NAMES`) get a kind-specific structural rule,
-    which is what makes loosening the import-only gate safe.
+    NEW_CONTEXT_KEY entries get the strictest rule (kwarg or
+    string-content only) regardless of whether the name is generic.
+    Specific names in other kinds need only a comment-safe sanity
+    check (any identifier or quoted-string match). Generic names
+    (`_GENERIC_SHORT_NAMES`) get a kind-specific structural rule.
     """
+    if kind is Kind.NEW_CONTEXT_KEY:
+        if root.find_all(_context_key_rule(name)):
+            return True
+        return _has_truncated_identifier(root, name)
     if name in _GENERIC_SHORT_NAMES:
         rule = _strict_generic_rule(kind, name)
         if rule is None:
@@ -504,6 +557,15 @@ def _build_matcher(watchlist: Watchlist) -> _Matcher:
         "py": {}, "py_other": {}, "xml": {},
     }
     for entry in watchlist.entries.values():
+        # Context keys get a dedicated tight pattern across all scopes
+        # to reject the `.attribute` form on shared-name model fields
+        # (`obj.employee_id`, `self.env.company`). XML scope entries
+        # are also dropped at match time by `_XML_BLOCKLIST_KINDS`.
+        if entry.kind is Kind.NEW_CONTEXT_KEY:
+            ck_pattern = _context_key_pattern(entry.short_name)
+            for scope in ("py", "py_other", "xml"):
+                compiled_by_scope[scope][entry.symbol] = ck_pattern
+            continue
         module = _module_path_of(entry.symbol)
         # Generic-named entries whose kind has no discriminating qualifier
         # rule (e.g. NEW_DECORATOR_OR_HELPER `join`) keep the import-only
