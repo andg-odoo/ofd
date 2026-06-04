@@ -20,6 +20,7 @@ from pathlib import Path
 from ofd.aggregate import Primitive, build_primitives
 from ofd.config import Config
 from ofd.events.record import Kind
+from ofd.gitio import resolve_github_base
 from ofd.ledger import format as fmt
 from ofd.ledger import frontmatter as fm
 from ofd.ledger.render import (
@@ -84,6 +85,20 @@ def _default_layout() -> list[tuple[str, str]]:
     ]
 
 
+def _build_repo_links(config: Config) -> dict[str, str]:
+    """Repo name -> GitHub source URL for every configured repo that
+    resolves to a GitHub-shaped origin. Computed once per `update()`
+    call; the renderer reads this map instead of shelling out to
+    `git remote get-url` per primitive.
+    """
+    out: dict[str, str] = {}
+    for r in config.repos:
+        url = resolve_github_base(r.source, r.mirror)
+        if url:
+            out[r.name] = url
+    return out
+
+
 def _atomic_write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
@@ -102,8 +117,15 @@ def update_one(
     config: Config,
     now: datetime | None = None,
     force_narrative: bool = False,
+    repo_links: dict[str, str] | None = None,
 ) -> Path:
-    """Render and write one ledger entry. Returns the written path."""
+    """Render and write one ledger entry. Returns the written path.
+
+    `repo_links` (repo name -> GitHub source URL) is built once by the
+    caller via `_build_repo_links` and threaded in so the per-commit
+    sample can render as a Ctrl+clickable link. Defaults to None for
+    callers that don't care (tests; ad-hoc invocations).
+    """
     now = now or datetime.now(tz=UTC)
     category = _category_dir(prim.kind)
     path = workspace / "ledger" / category / f"{_slugify(prim.symbol)}.md"
@@ -157,8 +179,8 @@ def update_one(
 
     regenerated = {
         "auto:summary": render_summary(prim, status),
-        "auto:before_after": render_before_after(prim, config.key_devs),
-        "auto:commits": render_commits(prim),
+        "auto:before_after": render_before_after(prim, config.key_devs, repo_links),
+        "auto:commits": render_commits(prim, repo_links=repo_links),
         "auto:adoption": render_adoption(prim),
     }
 
@@ -244,6 +266,7 @@ def update(
     """
     repo_names = [r.name for r in config.repos]
     primitives = build_primitives(workspace, repo_names)
+    repo_links = _build_repo_links(config)
 
     written: list[Path] = []
     skipped: list[str] = []
@@ -254,7 +277,11 @@ def update(
         if prim.kind not in _NEW_API_KINDS | _DEPRECATION_KINDS:
             skipped.append(f"{symbol}: kind={prim.kind.value} not promoted to ledger")
             continue
-        written.append(update_one(prim, workspace, config, force_narrative=force_narrative))
+        written.append(update_one(
+            prim, workspace, config,
+            force_narrative=force_narrative,
+            repo_links=repo_links,
+        ))
 
     deleted: list[Path] = []
     preserved: list[Path] = []

@@ -65,6 +65,67 @@ def add(
     click.echo("run 'ofd reindex --watchlist-changed' to replay rollout detection.", err=True)
 
 
+@watchlist_cli.command("annotate")
+@click.argument("symbol")
+@click.option("--workspace", "workspace_path", default=None)
+@click.option(
+    "--ancestor",
+    "ancestor",
+    default=None,
+    help=(
+        "Comma-separated XML ancestor tags. A rollout for SYMBOL will only "
+        "be emitted if the matched element has at least one ancestor in "
+        "this list. Use to disambiguate cases the RNG schema can't express "
+        "(e.g. `widget.invisible --ancestor list,tree` so form-view widget "
+        "matches don't fire)."
+    ),
+)
+@click.option(
+    "--clear-ancestor",
+    is_flag=True,
+    help="Drop any required_ancestor restriction on SYMBOL.",
+)
+def annotate(
+    symbol: str,
+    workspace_path: str | None,
+    ancestor: str | None,
+    clear_ancestor: bool,
+):
+    """Add user annotations to an existing watchlist entry.
+
+    Annotations survive `ofd reindex` (the symbol's regular extraction
+    stays idempotent; the annotation is carried forward unchanged).
+    """
+    if not ancestor and not clear_ancestor:
+        click.echo("nothing to set: pass --ancestor or --clear-ancestor", err=True)
+        sys.exit(2)
+    workspace = resolve_workspace(workspace_path)
+    wl = watchlist_mod.load(workspace)
+    target = symbol if symbol in wl.entries else next(
+        (e.symbol for e in wl.entries.values() if e.short_name == symbol),
+        None,
+    )
+    if target is None:
+        click.echo(f"not in watchlist: {symbol}", err=True)
+        sys.exit(1)
+    entry = wl.entries[target]
+    if clear_ancestor:
+        entry.required_ancestor = None
+        click.echo(f"cleared required_ancestor on {target}")
+    else:
+        tags = [t.strip() for t in (ancestor or "").split(",") if t.strip()]
+        entry.required_ancestor = tags or None
+        click.echo(
+            f"set required_ancestor={tags} on {target} "
+            f"(short_name={entry.short_name})"
+        )
+    watchlist_mod.save(wl, workspace)
+    click.echo(
+        "run 'ofd reindex --watchlist-changed' to replay rollout detection.",
+        err=True,
+    )
+
+
 @watchlist_cli.command("remove")
 @click.argument("symbol")
 @click.option("--workspace", "workspace_path", default=None)

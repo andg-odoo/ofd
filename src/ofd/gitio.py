@@ -4,6 +4,7 @@ tests can mock a single interface and the rest of the code stays CLI-free.
 
 from __future__ import annotations
 
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,18 +47,94 @@ def clone_bare_partial(source: str, target: Path) -> None:
     _run(["git", "clone", "--bare", "--filter=blob:none", source, str(target)])
 
 
+def remote_url(mirror: Path, remote: str = "origin") -> str | None:
+    """Return the configured URL for `<remote>`, or None if absent.
+
+    Used to derive a GitHub commit URL when the configured `source` is
+    a local filesystem path (the common dev setup) but the mirror still
+    has a real GitHub remote.
+    """
+    try:
+        return _run(
+            ["git", "remote", "get-url", remote], cwd=mirror, check=True,
+        ).strip() or None
+    except GitError:
+        return None
+
+
+# Tolerates the three real source-URL shapes Odoo configs use:
+# `git@github.com:org/repo.git`, `https://github.com/org/repo.git`,
+# `https://github.com/org/repo`. Anything else (including `/dev/null`
+# from test fixtures, or local `~/Dev/src/foo/.git` paths) returns None
+# from `github_commit_url` and callers fall back to plain text.
+_GITHUB_SOURCE_RE = re.compile(
+    r"^(?:git@github\.com:|https?://github\.com/)([^/]+)/([^/]+?)(?:\.git)?/?$"
+)
+
+
+def github_commit_url(source: str, sha: str) -> str | None:
+    """GitHub commit page URL derived from a repo source URL, or None
+    when `source` isn't a GitHub-shaped URL.
+    """
+    m = _GITHUB_SOURCE_RE.match(source)
+    if not m:
+        return None
+    owner, repo = m.group(1), m.group(2)
+    return f"https://github.com/{owner}/{repo}/commit/{sha}"
+
+
+def resolve_github_base(source: str, mirror: Path) -> str | None:
+    """Best-effort GitHub-shaped source URL for a repo, falling back to
+    the mirror's `origin` remote when `source` is a local path (dev
+    setups frequently configure `~/Dev/src/odoo/.git` rather than the
+    GitHub URL). Returns the *source* URL; pair with `github_commit_url`
+    to get the commit page.
+    """
+    if _GITHUB_SOURCE_RE.match(source):
+        return source
+    fallback = remote_url(mirror)
+    if fallback and _GITHUB_SOURCE_RE.match(fallback):
+        return fallback
+    return None
+
+
 def fetch(mirror: Path, branch: str) -> None:
+    """Fetch `<branch>` from `origin`, updating only the remote-tracking
+    ref `refs/remotes/origin/<branch>`.
+
+    We don't fastforward the local `<branch>` ref because the mirror
+    might be a normal working clone with `<branch>` checked out (a
+    common dev setup is to point ofd's mirror at `~/Dev/src/<repo>/.git`
+    rather than maintain a separate bare clone). Git refuses to update
+    a checked-out branch via fetch, which used to break `ofd run`
+    entirely. Reading via `origin/<branch>` works in both cases:
+    bare mirrors get the remote-tracking ref populated by fetch, and
+    working clones already have it.
+    """
     _run(
-        [
-            "git", "--git-dir", str(mirror), "fetch", "--prune", "origin",
-            f"{branch}:{branch}",
-        ]
+        ["git", "--git-dir", str(mirror), "fetch", "--prune", "origin", branch]
     )
+
+
+def _resolve_branch_ref(mirror: Path, branch: str) -> str:
+    """Pick the ref to read from. Prefers `origin/<branch>` so reads
+    are decoupled from whatever the local working copy has checked
+    out. Falls back to plain `<branch>` when `origin/<branch>` doesn't
+    exist (bare clones built without a configured remote, e.g. test
+    fixtures pushed to directly via `git push <bare>`).
+    """
+    verified = _run(
+        ["git", "--git-dir", str(mirror), "rev-parse", "--verify", "-q",
+         f"refs/remotes/origin/{branch}"],
+        check=False,
+    ).strip()
+    return f"origin/{branch}" if verified else branch
 
 
 def head_sha(mirror: Path, branch: str) -> str:
     return _run(
-        ["git", "--git-dir", str(mirror), "rev-parse", branch]
+        ["git", "--git-dir", str(mirror), "rev-parse",
+         _resolve_branch_ref(mirror, branch)]
     ).strip()
 
 
@@ -71,7 +148,8 @@ def log_commits(
     and branch tip. If since_sha is None, returns all commits touching the
     given paths.
     """
-    range_spec = f"{since_sha}..{branch}" if since_sha else branch
+    ref = _resolve_branch_ref(mirror, branch)
+    range_spec = f"{since_sha}..{ref}" if since_sha else ref
     args = [
         "git", "--git-dir", str(mirror), "log",
         "--no-merges", "--reverse", "--format=%H",
@@ -139,7 +217,8 @@ def log_commits_with_files(
     and what `prune_before` uses, so the walk and the prune agree.
     Combines with `since_sha`: git ANDs the two floors.
     """
-    range_spec = f"{since_sha}..{branch}" if since_sha else branch
+    ref = _resolve_branch_ref(mirror, branch)
+    range_spec = f"{since_sha}..{ref}" if since_sha else ref
     # \x1e bounds each commit section; git's `%x00` emits a NUL between
     # fields (sent as literal four chars since Python's subprocess
     # rejects real NULs in argv). Both are vanishingly rare in commit
@@ -288,6 +367,52 @@ def diff_patch(mirror: Path, sha: str, path: str) -> str:
             "diff-tree", "-p", "-r", "--no-color", sha, "--", path,
         ]
     )
+
+
+def grep_files(
+    mirror: Path,
+    sha: str,
+    needle: str,
+    *,
+    pathspec: str | None = None,
+) -> list[str]:
+    """Files at <sha> whose contents contain literal <needle>.
+
+    Used by the context-key baseline scan to cheaply prune the tree to
+    only `.py` files that mention `depends_context` before we AST-parse
+    them. `git grep` is dramatically faster than walking blob-by-blob.
+    """
+    args = ["git", "grep", "--name-only", "-F", needle, sha]
+    if pathspec:
+        args += ["--", pathspec]
+    out = _run(args, cwd=mirror, check=False)
+    paths: list[str] = []
+    for line in out.splitlines():
+        # `git grep` against a SHA prefixes each match with `<sha>:`.
+        if line.startswith(f"{sha}:"):
+            paths.append(line[len(sha) + 1 :])
+        elif line:
+            paths.append(line)
+    return paths
+
+
+def commit_at_or_before(
+    mirror: Path,
+    branch: str,
+    before_iso_date: str,
+) -> str | None:
+    """Last commit on <branch> committed strictly before <before_iso_date>.
+
+    Used to anchor a "tree state at the start of our tracking window" -
+    the baseline against which we decide which primitives are actually
+    new vs. just newly cited within the window.
+    """
+    ref = _resolve_branch_ref(mirror, branch)
+    out = _run(
+        ["git", "log", "-1", f"--before={before_iso_date}", "--format=%H", ref],
+        cwd=mirror, check=False,
+    )
+    return out.strip() or None
 
 
 def commit_diff_by_file(mirror: Path, sha: str) -> dict[str, str]:

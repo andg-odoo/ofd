@@ -94,7 +94,10 @@ def test_digest_collects_all_three_sections(tmp_path: Path, monkeypatch):
     )
     assert any(
         sym == "odoo.orm.models_cached.CachedModel"
-        for sym, _count, _sha in sections.adoption_velocity
+        for sym, _count, _repo, _sha in sections.adoption_velocity
+    )
+    assert all(
+        repo == "odoo" for _sym, _count, repo, _sha in sections.adoption_velocity
     )
     assert any(
         removal == "21.0" for _hint, removal, _warn in sections.deprecations
@@ -126,6 +129,40 @@ def test_digest_empty_window_shows_placeholders(tmp_path: Path, monkeypatch):
     sections = build_sections(workspace, config, start, end)
     content = render(sections, date(2000, 1, 2))
     assert "_None._" in content or "_No new rollouts" in content
+
+
+def test_digest_sample_commit_has_repo_prefix_and_link(tmp_path: Path, monkeypatch):
+    """Sample commit cell should be `[\\`repo@sha\\`](github_url)` when the
+    repo source resolves to a GitHub URL, and plain `\\`repo@sha\\`` text
+    when it doesn't (test fixtures use `source: /dev/null`)."""
+    from ofd.config import RepoConfig
+    from ofd.digest import DigestSections
+
+    sections = DigestSections()
+    sections.adoption_velocity = [
+        ("some.symbol", 3, "odoo", "abc123def456"),
+        ("other.sym", 1, "fixture_repo", "deadbeef0000"),
+    ]
+    repos = [
+        RepoConfig(
+            name="odoo",
+            source="git@github.com:odoo/odoo.git",
+            mirror=Path("/tmp"),
+            branch="master",
+            framework_paths=[],
+        ),
+        RepoConfig(
+            name="fixture_repo",
+            source="/dev/null",
+            mirror=Path("/tmp"),
+            branch="master",
+            framework_paths=[],
+        ),
+    ]
+    content = render(sections, date(2026, 5, 1), repos=repos)
+    assert "[`odoo@abc123def456`](https://github.com/odoo/odoo/commit/abc123def456)" in content
+    assert "`fixture_repo@deadbeef0000`" in content
+    assert "fixture_repo@deadbeef0000](" not in content  # no link for unparseable source
 
 
 def test_build_and_render_writes_file(tmp_path: Path, monkeypatch):

@@ -44,6 +44,15 @@ class WatchlistEntry:
     # matching so a `widget.invisible` entry only matches
     # `<widget ... invisible=...>`, not any `<field invisible=...>`.
     element: str | None = None
+    # User annotation: structurally restrict rollout matches to those
+    # whose XML element has at least one ancestor tag in this list.
+    # Set via `ofd watchlist annotate <symbol> --ancestor list,tree`.
+    # Used to disambiguate cases the RNG schema can't express - e.g.
+    # `<widget invisible=>` is only a real adoption of the new
+    # "list-view widget invisibility" feature when the widget sits
+    # under a <list>/<tree>; under <form>/<sheet> it's pre-existing.
+    # None / empty means no structural restriction.
+    required_ancestor: list[str] | None = None
 
 
 @dataclass
@@ -65,6 +74,21 @@ class Watchlist:
         if record.symbol in self.entries:
             return self.entries[record.symbol]
         short = record.symbol.rsplit(".", 1)[-1]
+        # Directive symbols look like `<file>.<parent>+<child>` so the
+        # naive last-segment short name comes out as `parent+child` -
+        # an opaque literal the matcher can't usefully scan for. For
+        # element/ref directives we prefer `record.directive`, the bare
+        # tag name, so the rollout matcher can search for `<child\b` in
+        # XML diffs. Shape directives (record.symbol ends in `+shape`)
+        # carry a structural fingerprint, not a tag name; leave their
+        # short alone so they stay effectively unmatchable rather than
+        # flooding the Aho-Corasick automaton with `shape`.
+        if (
+            record.kind is Kind.NEW_VIEW_DIRECTIVE
+            and record.directive
+            and not record.symbol.endswith("+shape")
+        ):
+            short = record.directive
         element = record.element if record.kind in _ELEMENT_SCOPED_KINDS else None
         entry = WatchlistEntry(
             symbol=record.symbol,
@@ -114,6 +138,12 @@ class Watchlist:
     def manual_entries(self) -> list[WatchlistEntry]:
         return [e for e in self.entries.values() if e.source == "manual"]
 
+    def annotated_entries(self) -> list[WatchlistEntry]:
+        """Entries carrying user-supplied annotations (e.g. required_ancestor).
+        Reindex carries these forward alongside manual pins so the user's
+        intent isn't wiped by a watchlist rebuild."""
+        return [e for e in self.entries.values() if e.required_ancestor]
+
     def short_names(self) -> set[str]:
         return {e.short_name for e in self.entries.values()}
 
@@ -142,6 +172,7 @@ class Watchlist:
                 source=v.get("source", "extracted"),
                 note=v.get("note"),
                 element=v.get("element"),
+                required_ancestor=v.get("required_ancestor") or None,
             )
             for s, v in raw_entries.items()
         }

@@ -32,8 +32,11 @@ level rather than by directory.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from ast_grep_py import SgRoot
 
+from ofd import gitio
 from ofd.events.record import ChangeRecord, Kind
 
 # Find a `decorator > call` whose called function name (or
@@ -110,13 +113,25 @@ def extract(
     parent_source: str | None,
     child_source: str | None,
     file: str,
+    baseline_keys: frozenset[str] | set[str] | None = None,
 ) -> list[ChangeRecord]:
-    """Emit one record per context key newly introduced in this file."""
+    """Emit one record per context key newly introduced in this file.
+
+    `baseline_keys` is the set of keys already in use anywhere in the
+    repo at the start of the tracking window. Anything in that set is
+    suppressed even if a newly-modified file adds an
+    `@api.depends_context(...)` decorator citing it - those are
+    "old key newly cited", not new primitives. Without this filter,
+    common framework-era keys (`lang`, `uid`, `allowed_company_ids`,
+    `partner_id`, ...) re-surface as primitives every time an addon
+    adopts the decorator on one of its compute methods.
+    """
     parent_keys = _depends_context_keys(parent_source)
     child_keys = _depends_context_keys(child_source)
+    baseline = baseline_keys or frozenset()
     new_keys = sorted(
         k for k in (child_keys.keys() - parent_keys.keys())
-        if not _is_default_field_key(k)
+        if not _is_default_field_key(k) and k not in baseline
     )
     return [
         ChangeRecord(
@@ -136,3 +151,23 @@ def extract(
         )
         for key in new_keys
     ]
+
+
+def scan_baseline_keys(mirror: Path, baseline_sha: str) -> set[str]:
+    """Set of context keys already in use at <baseline_sha>.
+
+    Walks every `.py` file at the baseline SHA whose contents mention
+    the literal `depends_context` (cheap `git grep -F` pre-filter),
+    AST-parses each, and unions the literal-string args. Result is the
+    "already known" denylist for `extract` to subtract.
+    """
+    candidates = gitio.grep_files(
+        mirror, baseline_sha, "depends_context", pathspec="*.py",
+    )
+    keys: set[str] = set()
+    for path in candidates:
+        source = gitio.show_blob(mirror, baseline_sha, path)
+        if source is None:
+            continue
+        keys.update(_depends_context_keys(source).keys())
+    return keys

@@ -183,6 +183,127 @@ def test_non_rng_file_returns_empty():
     assert records == []
 
 
+def test_nested_element_attributes_attach_to_inner_element():
+    """Real-shape diff from the upcoming column-stacking PR (35712a585e):
+    a brand-new inline `<rng:element name="column">` is added inside the
+    existing `list` define, with its own `string`, `column_invisible`,
+    `width` attributes. The inner attributes must NOT roll up to `list`
+    - that was the misattribution that produced phantom `list.width` /
+    `list.column_invisible` primitives. The user-facing record is just
+    the directive `list+column`; the column's own attribute set is
+    implicit in the new element."""
+    parent = _wrap("""
+    <rng:define name="list">
+        <rng:element name="list">
+            <rng:choice>
+                <rng:ref name="control"/>
+                <rng:ref name="field"/>
+                <rng:ref name="widget"/>
+            </rng:choice>
+        </rng:element>
+    </rng:define>
+    """)
+    child = _wrap("""
+    <rng:define name="list">
+        <rng:element name="list">
+            <rng:choice>
+                <rng:ref name="control"/>
+                <rng:ref name="field"/>
+                <rng:ref name="widget"/>
+                <rng:element name="column">
+                    <rng:optional><rng:attribute name="string"/></rng:optional>
+                    <rng:optional><rng:attribute name="column_invisible"/></rng:optional>
+                    <rng:optional><rng:attribute name="width"/></rng:optional>
+                    <rng:zeroOrMore><rng:ref name="field"/></rng:zeroOrMore>
+                </rng:element>
+            </rng:choice>
+        </rng:element>
+    </rng:define>
+    """)
+    records = extract(parent, child, "odoo/addons/base/rng/list_view.rng")
+    # No `list.column_invisible` / `list.width` misattribution.
+    list_attrs = [
+        r for r in records
+        if r.kind == Kind.NEW_VIEW_ATTRIBUTE and r.element == "list"
+    ]
+    assert list_attrs == [], (
+        f"column's attributes leaked onto list: {[r.symbol for r in list_attrs]}"
+    )
+    # Single directive record covers the new child element.
+    directives = [r for r in records if r.kind == Kind.NEW_VIEW_DIRECTIVE]
+    assert len(directives) == 1
+    assert directives[0].element == "list"
+    assert directives[0].directive == "column"
+
+
+def test_attribute_added_to_existing_inner_element_attaches_correctly():
+    """The follow-up case: once `column` exists in both old and new
+    schemas, adding an `align` attribute to it must emit `column.align`
+    (element=column), not `list.align`."""
+    parent = _wrap("""
+    <rng:define name="list">
+        <rng:element name="list">
+            <rng:element name="column">
+                <rng:optional><rng:attribute name="string"/></rng:optional>
+            </rng:element>
+        </rng:element>
+    </rng:define>
+    """)
+    child = _wrap("""
+    <rng:define name="list">
+        <rng:element name="list">
+            <rng:element name="column">
+                <rng:optional><rng:attribute name="string"/></rng:optional>
+                <rng:optional><rng:attribute name="align"/></rng:optional>
+            </rng:element>
+        </rng:element>
+    </rng:define>
+    """)
+    records = extract(parent, child, "odoo/addons/base/rng/list_view.rng")
+    new_attrs = [r for r in records if r.kind == Kind.NEW_VIEW_ATTRIBUTE]
+    assert len(new_attrs) == 1
+    assert new_attrs[0].element == "column"
+    assert new_attrs[0].attribute == "align"
+    assert new_attrs[0].symbol == "odoo.addons.base.rng.list_view.column.align"
+
+
+def test_pure_shape_restructure_no_longer_emits_directive():
+    """Restructuring a content model into a `<rng:choice>` without
+    adding any new attributes/refs/inline-elements used to emit a
+    `+shape` directive whose value was a structural fingerprint
+    (`group(attr:foo,ref:bar)`), not a tag name. The rollout matcher
+    has nothing to match against, so these always sat at zero rollouts.
+    No longer emitted."""
+    parent = _wrap("""
+    <rng:define name="thing">
+        <rng:element name="thing">
+            <rng:attribute name="a"/>
+            <rng:ref name="b"/>
+        </rng:element>
+    </rng:define>
+    """)
+    child = _wrap("""
+    <rng:define name="thing">
+        <rng:element name="thing">
+            <rng:choice>
+                <rng:group>
+                    <rng:attribute name="a"/>
+                    <rng:ref name="b"/>
+                </rng:group>
+            </rng:choice>
+        </rng:element>
+    </rng:define>
+    """)
+    records = extract(parent, child, "odoo/addons/base/rng/common.rng")
+    shape_directives = [
+        r for r in records
+        if r.kind == Kind.NEW_VIEW_DIRECTIVE
+        and r.symbol
+        and r.symbol.endswith("+shape")
+    ]
+    assert shape_directives == []
+
+
 def test_nothing_changed_emits_nothing():
     src = _wrap("""
     <rng:define name="thing">

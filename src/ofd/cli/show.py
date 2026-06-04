@@ -16,7 +16,23 @@ from ofd.ledger.read import find, iter_entries
 @click.option("--workspace", "workspace_path", default=None)
 @click.option("--path", "show_path", is_flag=True, help="Print the file path only.")
 @click.option("--raw", is_flag=True, help="Print raw markdown instead of rendered output.")
-def show(symbol: str, workspace_path: str | None, show_path: bool, raw: bool):
+@click.option(
+    "--no-pager",
+    is_flag=True,
+    help=(
+        "Print rendered output directly instead of paging through `less`. "
+        "Pager-by-default keeps Ctrl+click on commit links working under "
+        "tmux: scrolling the main buffer enters copy-mode and masks mouse "
+        "events, but less's alt-screen sidesteps that."
+    ),
+)
+def show(
+    symbol: str,
+    workspace_path: str | None,
+    show_path: bool,
+    raw: bool,
+    no_pager: bool,
+):
     """Print the ledger entry for SYMBOL.
 
     SYMBOL may be the fully-qualified dotted name or just the last
@@ -37,4 +53,4 @@ def show(symbol: str, workspace_path: str | None, show_path: bool, raw: bool):
         click.echo(content, nl=False)
         return
     from ofd.cli._theme import print_markdown
-    print_markdown(content)
+    print_markdown(content, paginate=not no_pager)

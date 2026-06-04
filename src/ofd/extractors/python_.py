@@ -21,6 +21,25 @@ from dataclasses import dataclass
 
 from ofd.events.record import ChangeRecord, Kind
 
+# Dunder methods we don't watchlist as new primitives. They're protocol
+# implementations - adding `__repr__` to a class isn't new API surface
+# anyone would adopt; it's a class plumbing change. Includes the rich
+# comparison family, the attribute-access protocol, the container
+# protocol, the context-manager protocol, hashing/equality, copy/reduce,
+# and `__set_name__`. Excludes `__init__` and `__new__` because changes
+# there reshape the public construction surface.
+_NOISY_DUNDER_METHODS: frozenset[str] = frozenset({
+    "__repr__", "__str__", "__hash__", "__eq__", "__ne__",
+    "__lt__", "__gt__", "__le__", "__ge__",
+    "__bool__", "__len__", "__iter__", "__next__", "__contains__",
+    "__getitem__", "__setitem__", "__delitem__",
+    "__getattr__", "__setattr__", "__delattr__",
+    "__enter__", "__exit__", "__call__",
+    "__set_name__", "__init_subclass__",
+    "__copy__", "__deepcopy__", "__reduce__", "__reduce_ex__",
+    "__format__", "__sizeof__", "__dir__",
+})
+
 
 def _parse(source: str | None) -> ast.Module | None:
     """ast.parse, but don't let Odoo source's `\\s`-in-plain-string noise
@@ -309,6 +328,15 @@ def extract(
                 after_snippet=sym.source,
             ))
         elif sym.kind == "func":
+            # Skip pure-protocol dunders. Adding `__repr__` / `__eq__` /
+            # `__set_name__` to a class is implementation detail, not new
+            # API surface anyone would adopt - they pile up as zero-rollout
+            # ledger entries forever. `__init__` and `__new__` stay
+            # because changes there reshape the constructor surface
+            # (and the kwarg-level changes get NEW_KWARG records anyway).
+            last = name.rsplit(".", 1)[-1]
+            if last in _NOISY_DUNDER_METHODS:
+                continue
             records.append(ChangeRecord(
                 kind=Kind.NEW_DECORATOR_OR_HELPER,
                 file=file,

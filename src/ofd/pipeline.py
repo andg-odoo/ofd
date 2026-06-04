@@ -13,6 +13,7 @@ Per-repo sequential commit processing:
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -21,8 +22,9 @@ from ofd import gitio
 from ofd import state as state_mod
 from ofd import watchlist as watchlist_mod
 from ofd.config import Config, RepoConfig
-from ofd.events.record import ChangeRecord, CommitEnvelope, CommitRecord
-from ofd.events.store import raw_path, write as write_record
+from ofd.events.record import ChangeRecord, CommitEnvelope, CommitRecord, Kind
+from ofd.events.store import raw_path
+from ofd.events.store import write as write_record
 from ofd.extractors import context_keys
 from ofd.extractors.dispatcher import extract_for_file
 from ofd.globs import match_any
@@ -35,6 +37,64 @@ from ofd.watchlist import Watchlist
 
 def _is_gated(path: str, patterns: list[str]) -> bool:
     return match_any(path, patterns)
+
+
+def _dedupe_kwarg_overrides(records: list[ChangeRecord]) -> list[ChangeRecord]:
+    """Collapse `Class.method.kwarg` duplicates within a single commit.
+
+    When a commit adds the same kwarg to a method override across
+    multiple Field subclasses (e.g. `Field.to_sql.table`,
+    `BaseString.to_sql.table`, `Many2one.to_sql.table` all in the same
+    PR), the matcher's per-hunk dedupe attributes every adoption to
+    just one entry - the others sit in the ledger as zero-rollout
+    shadows of the same logical primitive.
+
+    Heuristic: group by `(method_name, kwarg_name)` (last two symbol
+    segments). When a group has >1 entry, keep the alphabetically-first
+    symbol (which puts `Field` ahead of `BaseString`/`Many2one`/etc.
+    because `fields.py` < `fields_textual.py` / `fields_relational.py`
+    in module-path sort order). Drop the rest.
+
+    Cross-commit shadows aren't touched - if a subclass override lands
+    in a separate PR, its symbol is preserved. This is the in-flight
+    PR pattern, not a long-tail concern.
+    """
+    by_method_kwarg: dict[tuple[str, str], list[ChangeRecord]] = {}
+    others: list[ChangeRecord] = []
+    for r in records:
+        if r.kind is not Kind.NEW_KWARG or not r.symbol:
+            others.append(r)
+            continue
+        parts = r.symbol.split(".")
+        if len(parts) < 4:
+            others.append(r)
+            continue
+        by_method_kwarg.setdefault((parts[-2], parts[-1]), []).append(r)
+    out: list[ChangeRecord] = list(others)
+    for group in by_method_kwarg.values():
+        if len(group) == 1:
+            out.append(group[0])
+            continue
+        out.append(min(group, key=lambda r: r.symbol))
+    return out
+
+
+def _rollout_postdates_definition(
+    rollout: ChangeRecord,
+    watchlist: Watchlist,
+    commit_at: str,
+) -> bool:
+    """True iff `rollout`'s commit isn't earlier than the watchlisted
+    primitive's first_seen_at. ISO-8601 strings compare correctly
+    lexicographically; manual pins (`first_seen_at = "(manual)"`) sort
+    before any real ISO date so they're always kept.
+    """
+    if not rollout.symbol:
+        return True
+    entry = watchlist.entries.get(rollout.symbol)
+    if entry is None:
+        return True
+    return entry.first_seen_at <= commit_at
 
 
 def _any_rollout_candidate(changed_files: list[str], watchlist: Watchlist) -> bool:
@@ -80,6 +140,7 @@ def process_commit(
     preloaded_info: gitio.CommitInfo | None = None,
     blob_fetcher: gitio.BlobFetcher | None = None,
     repo_state=None,
+    baseline_context_keys: frozenset[str] | None = None,
 ) -> CommitRecord | None:
     """Run extract + rollout + score for one commit. Returns a CommitRecord
     if any changes were found, else None. Does not persist - caller writes.
@@ -171,7 +232,14 @@ def process_commit(
                 child_src = _fetch(sha, file)
                 child_sources[file] = child_src
             parent_src = _fetch(f"{sha}^", file)
-            changes.extend(context_keys.extract(parent_src, child_src, file))
+            changes.extend(context_keys.extract(
+                parent_src, child_src, file,
+                baseline_keys=baseline_context_keys,
+            ))
+
+    # Collapse same-commit override duplicates before they reach the
+    # watchlist so they never become shadow entries in the first place.
+    changes = _dedupe_kwarg_overrides(changes)
 
     # --- stage 2: watchlist update (before rollout scan) ---
     for record in changes:
@@ -197,7 +265,28 @@ def process_commit(
         # Earlier versions ran the same regex twice - once as a
         # "should we fetch child source?" pre-check and once in
         # detect_rollouts - which profiled as ~85% of runtime.
-        rollouts = detect_rollouts(patches, watchlist, child_sources)
+        rollouts = detect_rollouts(
+            patches, watchlist, child_sources,
+            fetch_child=lambda f: _fetch(sha, f),
+        )
+        # Temporal filter: drop rollouts whose commit predates the
+        # primitive's first_seen_at. Within a single repo this can't
+        # happen (commits are walked oldest-first, so a definition is
+        # always added to the watchlist before any later same-repo
+        # rollout). It DOES happen across repos: `_ordered_for_watchlist_build`
+        # runs the framework repo's full history before the adopter
+        # repo, so by the time we reach an early adopter-repo commit,
+        # primitives defined years later in the framework repo are
+        # already on the watchlist. Any such "rollout" is temporally
+        # impossible - the syntax can match (e.g. `<widget invisible=...>`
+        # was already legal at runtime before the RNG schema formalized
+        # it), but it's not an adoption of *this* primitive. Manual
+        # pins carry `first_seen_at = "(manual)"` which sorts lexicographically
+        # before any ISO date, so they pass through unchanged.
+        rollouts = [
+            r for r in rollouts
+            if _rollout_postdates_definition(r, watchlist, envelope.committed_at)
+        ]
         hit_files = {r.file for r in rollouts if r.file not in child_sources}
         for file in hit_files:
             child_sources[file] = _fetch(sha, file)
@@ -258,6 +347,12 @@ def run_repo(
         bound = since_sha[:10] if since_sha else since_date or "full history"
         status_cb(f"{repo.name}: enumerating commits (since {bound})...")
 
+    # Pre-existing context keys: anything already declared via
+    # `@api.depends_context(...)` at the start of the tracking window
+    # is suppressed at extraction time. Computed once per repo, cached
+    # to disk by baseline SHA so re-runs skip the rescan.
+    baseline_keys = _load_or_build_baseline_keys(repo, config, status_cb)
+
     # Bulk-enumerate commits + their file lists in a single git call -
     # orders of magnitude faster than per-commit diff-tree when most
     # commits only touch non-gated paths.
@@ -296,6 +391,7 @@ def run_repo(
                 repo, sha, config, watchlist,
                 preloaded_files=changed, preloaded_info=info,
                 blob_fetcher=fetcher, repo_state=repo_state,
+                baseline_context_keys=baseline_keys,
             )
             if record:
                 write_record(config.workspace, record)
@@ -315,6 +411,55 @@ def run_repo(
                 progress_cb(repo.name, sha, i, total)
 
     return summaries
+
+
+def _load_or_build_baseline_keys(
+    repo: RepoConfig,
+    config: Config,
+    status_cb: StatusCb | None,
+) -> frozenset[str]:
+    """Resolve the baseline SHA from `since_date`, scan the tree there
+    for `@api.depends_context` keys, and cache the result by SHA. If
+    the cache hit matches the resolved SHA, skip the scan.
+
+    Returns an empty set when the config has no `since_date` or no
+    commit predates it on the tracked branch (fresh repo, or the entire
+    branch was authored after the floor) - in either case there's no
+    "before" snapshot to compare against, so every emission is
+    considered new on its own merits.
+    """
+    if not config.since_date:
+        return frozenset()
+    try:
+        baseline_sha = gitio.commit_at_or_before(
+            repo.mirror, repo.branch, config.since_date,
+        )
+    except gitio.GitError:
+        return frozenset()
+    if not baseline_sha:
+        return frozenset()
+    cache_path = (
+        config.workspace / "baselines" / f"context_keys.{repo.name}.json"
+    )
+    if cache_path.exists():
+        try:
+            data = json.loads(cache_path.read_text())
+            if data.get("baseline_sha") == baseline_sha:
+                return frozenset(data.get("keys", []))
+        except (OSError, ValueError):
+            pass
+    if status_cb:
+        status_cb(
+            f"{repo.name}: scanning baseline context keys at "
+            f"{baseline_sha[:10]} (one-time, cached)..."
+        )
+    keys = context_keys.scan_baseline_keys(repo.mirror, baseline_sha)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(
+        {"baseline_sha": baseline_sha, "keys": sorted(keys)},
+        indent=2,
+    ) + "\n")
+    return frozenset(keys)
 
 
 def _ordered_for_watchlist_build(repos: list[RepoConfig]) -> list[RepoConfig]:

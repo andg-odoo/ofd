@@ -1,7 +1,11 @@
 """Per-section renderers for a ledger entry.
 
-Pure string rendering. No I/O. The update command composes these with
-the frontmatter + format modules to write out a full file.
+Pure string rendering. The update command composes these with the
+frontmatter + format modules to write out a full file. The only I/O is
+an optional `git remote get-url origin` lookup per repo (cached via the
+`repo_links` map the caller threads through) so a sample commit can
+render as a Ctrl+clickable `[repo@sha](github_url)` link instead of a
+bare hash that gives no clue which repo it lives in.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ from ofd.aggregate import (
     select_definition_commit,
 )
 from ofd.events.record import Kind
+from ofd.gitio import github_commit_url
 
 
 def derive_replaces(prim: Primitive) -> str | None:
@@ -69,19 +74,32 @@ def render_summary(prim: Primitive, status: str) -> str:
     return "\n".join(parts)
 
 
-def render_before_after(prim: Primitive, key_devs: list[str]) -> str:
+def render_before_after(
+    prim: Primitive,
+    key_devs: list[str],
+    repo_links: dict[str, str] | None = None,
+) -> str:
     chosen = select_canonical_rollout(prim, key_devs)
     if chosen is None:
         if prim.after_snippet:
             lang = _lang_for(prim.file or "")
+            def_ref = (
+                _commit_ref(
+                    prim.definition_commits[0].repo,
+                    prim.definition_commits[0].sha,
+                    repo_links,
+                )
+                if prim.definition_commits else ""
+            )
             return (
-                f"**Definition** (`{prim.file}` at {_short(prim.definition_commits[0].sha) if prim.definition_commits else ''}):\n\n"
+                f"**Definition** (`{prim.file}` at {def_ref}):\n\n"
                 f"```{lang}\n{prim.after_snippet}\n```"
             )
         return "_No rollout examples recorded yet._"
     lang = _lang_for(chosen.file)
     lines: list[str] = []
-    header = f"**Before** (`{chosen.file}` at {_short(chosen.commit.sha)}):"
+    ref = _commit_ref(chosen.commit.repo, chosen.commit.sha, repo_links)
+    header = f"**Before** (`{chosen.file}` at {ref}):"
     lines.append(header)
     lines.append("")
     lines.append(f"```{lang}")
@@ -96,13 +114,18 @@ def render_before_after(prim: Primitive, key_devs: list[str]) -> str:
     return "\n".join(lines)
 
 
-def render_commits(prim: Primitive, limit: int = 10) -> str:
+def render_commits(
+    prim: Primitive,
+    limit: int = 10,
+    repo_links: dict[str, str] | None = None,
+) -> str:
     lines: list[str] = []
     if prim.definition_commits:
         lines.append("**Definition:**")
         for c in prim.definition_commits:
+            ref = _commit_ref(c.repo, c.sha, repo_links)
             lines.append(
-                f"- `{_short(c.sha)}` - {c.subject} ({c.author_name}, {c.committed_at.split('T')[0]})"
+                f"- {ref} - {c.subject} ({c.author_name}, {c.committed_at.split('T')[0]})"
             )
         lines.append("")
     if prim.rollouts:
@@ -117,11 +140,12 @@ def render_commits(prim: Primitive, limit: int = 10) -> str:
         for shown, (sha, rs) in enumerate(ordered):
             if shown >= limit:
                 break
-            ref = rs[0].commit
+            commit = rs[0].commit
             mods = sorted({r.file for r in rs})
             mod_display = mods[0] if len(mods) == 1 else f"{len(mods)} files"
+            ref = _commit_ref(commit.repo, sha, repo_links)
             lines.append(
-                f"- `{_short(sha)}` - {mod_display} ({ref.author_name}, {ref.committed_at.split('T')[0]})"
+                f"- {ref} - {mod_display} ({commit.author_name}, {commit.committed_at.split('T')[0]})"
             )
         if len(ordered) > limit:
             lines.append(f"- ... {len(ordered) - limit} more")
@@ -141,6 +165,21 @@ def render_adoption(prim: Primitive) -> str:
 
 def _short(sha: str, n: int = 12) -> str:
     return sha[:n]
+
+
+def _commit_ref(repo: str, sha: str, repo_links: dict[str, str] | None) -> str:
+    """Format a commit as `[\\`repo@sha\\`](github_url)` when we have a
+    GitHub-shaped source for the repo, else the plain `\\`repo@sha\\``.
+
+    `repo_links` maps repo name -> GitHub source URL (the form
+    `git@github.com:org/repo.git` or `https://github.com/org/repo.git`),
+    typically built once by the caller via `gitio.resolve_github_base`.
+    """
+    short = _short(sha)
+    label = f"{repo}@{short}"
+    source = (repo_links or {}).get(repo)
+    url = github_commit_url(source, short) if source else None
+    return f"[`{label}`]({url})" if url else f"`{label}`"
 
 
 def _lang_for(file: str) -> str:

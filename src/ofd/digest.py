@@ -19,15 +19,16 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
-from ofd.config import Config
+from ofd.config import Config, RepoConfig
 from ofd.events.record import DEFINITION_KINDS, Kind
 from ofd.events.store import iter_repo
+from ofd.gitio import github_commit_url, resolve_github_base
 
 
 @dataclass
 class DigestSections:
     new_primitives: list[tuple[str, str, str]] = field(default_factory=list)  # (symbol, kind, subject)
-    adoption_velocity: list[tuple[str, int, str]] = field(default_factory=list)  # (symbol, count_in_window, sample_commit)
+    adoption_velocity: list[tuple[str, int, str, str]] = field(default_factory=list)  # (symbol, count, repo, sample_sha)
     deprecations: list[tuple[str, str, str]] = field(default_factory=list)  # (symbol, removal_version, warning)
 
 
@@ -45,7 +46,7 @@ def build_sections(
 ) -> DigestSections:
     new_by_symbol: dict[str, tuple[str, str]] = {}
     adoption_counts: dict[str, int] = defaultdict(int)
-    adoption_sample: dict[str, str] = {}
+    adoption_sample: dict[str, tuple[str, str]] = {}  # symbol -> (repo, sha)
     deprecations: list[tuple[str, str, str]] = []
 
     for repo in config.repos:
@@ -62,7 +63,8 @@ def build_sections(
                 elif change.kind == Kind.ROLLOUT and change.symbol:
                     adoption_counts[change.symbol] += 1
                     adoption_sample.setdefault(
-                        change.symbol, commit_record.commit.sha
+                        change.symbol,
+                        (commit_record.commit.repo, commit_record.commit.sha),
                     )
                 elif change.kind == Kind.DEPRECATION_WARNING_ADDED:
                     deprecations.append((
@@ -77,15 +79,29 @@ def build_sections(
     for sym, count in sorted(
         adoption_counts.items(), key=lambda kv: (-kv[1], kv[0])
     ):
-        sections.adoption_velocity.append((sym, count, adoption_sample[sym][:12]))
+        repo_name, sha = adoption_sample[sym]
+        sections.adoption_velocity.append((sym, count, repo_name, sha[:12]))
     sections.deprecations = deprecations
     return sections
 
 
-def render(sections: DigestSections, target_date: date) -> str:
-    """Render a digest into markdown."""
+def render(
+    sections: DigestSections,
+    target_date: date,
+    repos: list[RepoConfig] | None = None,
+) -> str:
+    """Render a digest into markdown.
+
+    `repos` is used to derive a GitHub commit URL per sample, so the
+    sample-commit cell renders as a clickable `[repo@sha](url)` link.
+    Without it (e.g. test fixtures with `source: /dev/null`), the cell
+    falls back to plain `repo@sha` text.
+    """
+    sources_by_repo = {
+        r.name: resolve_github_base(r.source, r.mirror) or "" for r in (repos or [])
+    }
     total_primitives = len(sections.new_primitives)
-    total_rollouts = sum(c for _, c, _ in sections.adoption_velocity)
+    total_rollouts = sum(c for _, c, _, _ in sections.adoption_velocity)
     total_deprecations = len(sections.deprecations)
 
     lines: list[str] = [
@@ -118,8 +134,11 @@ def render(sections: DigestSections, target_date: date) -> str:
     if sections.adoption_velocity:
         lines.append("| Rollouts | Symbol | Sample commit |")
         lines.append("|---:|---|---|")
-        for sym, count, sha in sections.adoption_velocity:
-            lines.append(f"| {count} | `{sym}` | `{sha}` |")
+        for sym, count, repo, sha in sections.adoption_velocity:
+            label = f"{repo}@{sha}"
+            url = github_commit_url(sources_by_repo.get(repo, ""), sha)
+            cell = f"[`{label}`]({url})" if url else f"`{label}`"
+            lines.append(f"| {count} | `{sym}` | {cell} |")
     else:
         lines.append("_No new rollouts of watchlisted primitives._")
     lines.append("")
@@ -163,6 +182,6 @@ def build_and_render(
     end = datetime.combine(target_date, datetime.max.time()).replace(tzinfo=UTC)
     start = end - timedelta(days=window_days)
     sections = build_sections(workspace, config, start, end)
-    content = render(sections, target_date)
+    content = render(sections, target_date, repos=config.repos)
     path = write(workspace, target_date, content)
     return path, content

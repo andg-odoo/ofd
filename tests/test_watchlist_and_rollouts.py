@@ -507,6 +507,398 @@ def test_shared_short_name_emits_one_rollout_per_hunk():
     assert len(records) == 1  # NOT 4
 
 
+# --- Language gate: cross-language false positives ---
+
+
+def test_python_primitive_not_matched_in_js_file():
+    """Regression: `PropertiesDefinition.setup` (Python helper) must not
+    match `setup() { super.setup(...) }` in an OWL component patch. Every
+    OWL component has a `setup()` lifecycle method; without the language
+    gate, every patched component looks like a rollout."""
+    wl = _watchlist_with("odoo.orm.fields_properties.PropertiesDefinition.setup")
+    patch = """\
+--- /dev/null
++++ b/documents_account/static/src/components/x.js
+@@ -0,0 +1,5 @@
++patch(MailAttachments.prototype, {
++    setup() {
++        super.setup(...arguments);
++    },
++});
+"""
+    records = detect_rollouts(
+        {"documents_account/static/src/components/x.js": patch}, wl, {},
+    )
+    assert records == []
+
+
+def test_context_key_not_matched_in_js_file():
+    """Regression: `partner_id` context key must not match `partner_id =
+    fields.One(...)` in a JS Record class - it's a JS field declaration,
+    not a context-key adoption."""
+    wl = Watchlist()
+    wl.add_manual(symbol="partner_id", active_version="19.4")
+    patch = """\
+--- /dev/null
++++ b/ai/static/src/discuss/core/common/ai_agent_model.js
+@@ -0,0 +1,4 @@
++export class AiAgent extends Record {
++    static _name = "ai.agent";
++    partner_id = fields.One("res.partner");
++}
+"""
+    records = detect_rollouts(
+        {"ai/static/src/discuss/core/common/ai_agent_model.js": patch}, wl, {},
+    )
+    assert records == []
+
+
+def test_view_kind_does_not_match_in_python_file():
+    """A NEW_VIEW_ATTRIBUTE entry has language=VIEW; a `.py` diff that
+    happens to contain the attribute name as a string must not fire."""
+    wl = _watchlist_with_rng_attr("widget", "invisible")
+    patch = """\
+--- a/m.py
++++ b/m.py
+@@ -1,1 +1,2 @@
+ x = 1
++    return attrs.get('invisible', False)
+"""
+    assert detect_rollouts({"m.py": patch}, wl, {}) == []
+
+
+def test_new_kwarg_not_matched_in_xml_file():
+    """NEW_KWARG entries are PY-only - a `<button kind="primary"/>`
+    isn't an adoption of a `kind` kwarg even if the names collide."""
+    wl = Watchlist()
+    wl.add_from_definition(
+        ChangeRecord(
+            kind=Kind.NEW_KWARG,
+            file="odoo/fields.py",
+            line=1,
+            symbol="odoo.fields.Many2one.__init__.kind",
+        ),
+        repo="odoo", sha="abc", committed_at="2026-04-01T00:00:00Z",
+        active_version="20.0",
+    )
+    patch = """\
+--- a/v.xml
++++ b/v.xml
+@@ -1,1 +1,2 @@
+ <list>
++    <button kind="primary"/>
+"""
+    assert detect_rollouts({"v.xml": patch}, wl, {}) == []
+
+
+def test_unknown_extension_skipped():
+    """Files with no recognized language extension (.po, .scss, .csv, ...)
+    are skipped wholesale - they never get scanned for any kind."""
+    wl = _watchlist_with("odoo.orm.models_cached.CachedModel")
+    po_patch = """\
+--- a/m.po
++++ b/m.po
+@@ -1,1 +1,2 @@
+ msgid "old"
++msgid "use CachedModel for caching"
+"""
+    scss_patch = """\
+--- a/s.scss
++++ b/s.scss
+@@ -1,1 +1,2 @@
+ .foo { color: red; }
++.CachedModel { color: blue; }
+"""
+    assert detect_rollouts({"m.po": po_patch, "s.scss": scss_patch}, wl, {}) == []
+
+
+def test_directive_rollout_matches_child_opening_tag():
+    """NEW_VIEW_DIRECTIVE rollouts (e.g. `list+column`) must match the
+    child element's opening tag in XML diffs, not look for it as an
+    attribute on the parent. Pre-fix, the matcher compiled an
+    attribute-shaped regex that essentially never fired."""
+    wl = Watchlist()
+    wl.add_from_definition(
+        ChangeRecord(
+            kind=Kind.NEW_VIEW_DIRECTIVE,
+            file="odoo/addons/base/rng/list_view.rng",
+            line=1,
+            element="list",
+            directive="column",
+            symbol="odoo.addons.base.rng.list_view.list+column",
+        ),
+        repo="odoo", sha="abc", committed_at="2026-04-09T00:00:00Z",
+        active_version="20.0",
+    )
+    patch = """\
+--- a/v.xml
++++ b/v.xml
+@@ -1,1 +1,4 @@
+ <list>
++    <column string="Total">
++        <field name="amount"/>
++    </column>
+"""
+    records = detect_rollouts({"v.xml": patch}, wl, {})
+    assert len(records) == 1
+    assert records[0].symbol == "odoo.addons.base.rng.list_view.list+column"
+
+
+def test_directive_rollout_does_not_match_attribute_shape():
+    """A directive whose name appears as an *attribute* on something
+    must not fire (it isn't an adoption of the child-element shape)."""
+    wl = Watchlist()
+    wl.add_from_definition(
+        ChangeRecord(
+            kind=Kind.NEW_VIEW_DIRECTIVE,
+            file="odoo/addons/base/rng/list_view.rng",
+            line=1,
+            element="list",
+            directive="column",
+            symbol="odoo.addons.base.rng.list_view.list+column",
+        ),
+        repo="odoo", sha="abc", committed_at="2026-04-09T00:00:00Z",
+        active_version="20.0",
+    )
+    patch = """\
+--- a/v.xml
++++ b/v.xml
+@@ -1,1 +1,2 @@
+ <form>
++    <field name="x" column="2"/>
+"""
+    assert detect_rollouts({"v.xml": patch}, wl, {}) == []
+
+
+# --- required_ancestor: structural ancestor restriction ---
+
+
+def _watchlist_with_widget_invisible(
+    required_ancestor: list[str] | None = None,
+) -> Watchlist:
+    wl = _watchlist_with_rng_attr("widget", "invisible")
+    entry = wl.entries["odoo.addons.base.rng.common.widget.invisible"]
+    entry.required_ancestor = required_ancestor
+    return wl
+
+
+def test_required_ancestor_accepts_widget_inside_list():
+    """`<widget invisible=>` directly under `<list>` matches when
+    required_ancestor=['list','tree'] - this is the new feature
+    `0aa942313fa1` actually shipped."""
+    wl = _watchlist_with_widget_invisible(["list", "tree"])
+    patch = """\
+--- a/v.xml
++++ b/v.xml
+@@ -1,1 +1,4 @@
+ <list>
++    <widget name="ribbon" invisible="state == 'draft'"/>
++    <field name="x"/>
+ </list>
+"""
+    child = (
+        "<list>\n"
+        "  <widget name='ribbon' invisible=\"state == 'draft'\"/>\n"
+        "  <field name='x'/>\n"
+        "</list>\n"
+    )
+    records = detect_rollouts({"v.xml": patch}, wl, {"v.xml": child})
+    assert len(records) == 1
+
+
+def test_required_ancestor_rejects_widget_inside_form():
+    """`<widget invisible=>` inside a `<form>` is rejected when
+    required_ancestor=['list','tree'] - form-view widgets have always
+    supported invisible at runtime, so this isn't an adoption of the
+    new list-view feature."""
+    wl = _watchlist_with_widget_invisible(["list", "tree"])
+    patch = """\
+--- a/v.xml
++++ b/v.xml
+@@ -1,1 +1,3 @@
+ <form>
++    <widget name="ribbon" invisible="state == 'draft'"/>
+ </form>
+"""
+    child = (
+        "<form>\n"
+        "  <widget name='ribbon' invisible=\"state == 'draft'\"/>\n"
+        "</form>\n"
+    )
+    assert detect_rollouts({"v.xml": patch}, wl, {"v.xml": child}) == []
+
+
+def test_required_ancestor_handles_deep_nesting():
+    """Ancestor walk is unbounded - a `<widget>` several levels deep
+    inside `<list>` (e.g. behind a `<header>`) still qualifies."""
+    wl = _watchlist_with_widget_invisible(["list"])
+    patch = """\
+--- a/v.xml
++++ b/v.xml
+@@ -1,1 +1,7 @@
+ <list>
++    <header>
++      <group>
++        <widget name="ribbon" invisible="x"/>
++      </group>
++    </header>
+ </list>
+"""
+    child = (
+        "<list>"
+        "<header><group>"
+        "<widget name='ribbon' invisible=\"x\"/>"
+        "</group></header>"
+        "</list>"
+    )
+    assert len(detect_rollouts({"v.xml": patch}, wl, {"v.xml": child})) == 1
+
+
+def test_required_ancestor_uses_lazy_fetcher_when_child_source_absent():
+    """If `child_sources` doesn't include the file, the matcher pulls
+    it via `fetch_child` lazily - this is how the pipeline avoids
+    pre-fetching every potential hit."""
+    wl = _watchlist_with_widget_invisible(["list"])
+    patch = """\
+--- a/v.xml
++++ b/v.xml
+@@ -1,1 +1,2 @@
+ <list>
++    <widget name="r" invisible="x"/>
+"""
+    fetched: list[str] = []
+    def fake_fetch(file: str):
+        fetched.append(file)
+        return "<list><widget name='r' invisible=\"x\"/></list>"
+    records = detect_rollouts(
+        {"v.xml": patch}, wl, child_sources={}, fetch_child=fake_fetch,
+    )
+    assert fetched == ["v.xml"]
+    assert len(records) == 1
+
+
+def test_required_ancestor_rejects_when_child_source_unavailable():
+    """No child source AND no fetcher means we can't structurally
+    confirm - reject conservatively (the user opted into strictness
+    by setting the annotation)."""
+    wl = _watchlist_with_widget_invisible(["list"])
+    patch = """\
+--- a/v.xml
++++ b/v.xml
+@@ -1,1 +1,2 @@
+ <list>
++    <widget name="r" invisible="x"/>
+"""
+    assert detect_rollouts({"v.xml": patch}, wl, {}) == []
+
+
+def test_required_ancestor_persists_through_serialization(tmp_path: Path):
+    wl = _watchlist_with_widget_invisible(["list", "tree"])
+    save(wl, tmp_path)
+    got = load(tmp_path)
+    entry = got.entries["odoo.addons.base.rng.common.widget.invisible"]
+    assert entry.required_ancestor == ["list", "tree"]
+
+
+def test_annotated_entries_helper_returns_only_annotated():
+    wl = _watchlist_with_widget_invisible(["list"])
+    annotated = wl.annotated_entries()
+    assert len(annotated) == 1
+    assert annotated[0].symbol == "odoo.addons.base.rng.common.widget.invisible"
+
+
+# --- shared-short-name kwarg discrimination by call-site method ---
+
+
+def _seed_kwarg(wl: Watchlist, symbol: str) -> None:
+    wl.add_from_definition(
+        ChangeRecord(
+            kind=Kind.NEW_KWARG, file="x.py", line=1, symbol=symbol,
+        ),
+        repo="odoo", sha="abc", committed_at="2026-04-01T00:00:00Z",
+        active_version="20.0",
+    )
+
+
+def test_method_discriminator_attributes_to_correct_method():
+    """Two NEW_KWARG entries share short_name `table` across different
+    methods. A single `condition_to_sql(table=...)` call must attribute
+    only to the condition_to_sql entry, not the to_sql one."""
+    wl = Watchlist()
+    _seed_kwarg(wl, "odoo.orm.fields.Field.to_sql.table")
+    _seed_kwarg(wl, "odoo.orm.fields.Field.condition_to_sql.table")
+    patch = """\
+--- a/x.py
++++ b/x.py
+@@ -1,1 +1,2 @@
+ a = 1
++    return self.condition_to_sql(table=t)
+"""
+    records = detect_rollouts({"x.py": patch}, wl, {})
+    symbols = [r.symbol for r in records]
+    assert symbols == ["odoo.orm.fields.Field.condition_to_sql.table"]
+
+
+def test_method_discriminator_emits_per_method_when_both_present():
+    """If a single hunk calls BOTH methods with the same kwarg, both
+    entries fire - they're independent adoptions of distinct primitives
+    that happen to share a kwarg name."""
+    wl = Watchlist()
+    _seed_kwarg(wl, "odoo.orm.fields.Field.to_sql.table")
+    _seed_kwarg(wl, "odoo.orm.fields.Field.condition_to_sql.table")
+    patch = """\
+--- a/x.py
++++ b/x.py
+@@ -1,1 +1,3 @@
+ a = 1
++    self.to_sql(table=t1)
++    self.condition_to_sql(table=t2)
+"""
+    records = detect_rollouts({"x.py": patch}, wl, {})
+    symbols = sorted(r.symbol for r in records)
+    assert symbols == [
+        "odoo.orm.fields.Field.condition_to_sql.table",
+        "odoo.orm.fields.Field.to_sql.table",
+    ]
+
+
+def test_method_discriminator_drops_kwarg_to_unrelated_method():
+    """`some_other_method(table=t)` shares the kwarg name but isn't an
+    adoption of either watchlisted entry - should fire 0 rollouts."""
+    wl = Watchlist()
+    _seed_kwarg(wl, "odoo.orm.fields.Field.to_sql.table")
+    _seed_kwarg(wl, "odoo.orm.fields.Field.condition_to_sql.table")
+    patch = """\
+--- a/x.py
++++ b/x.py
+@@ -1,1 +1,2 @@
+ a = 1
++    self.unrelated_method(table=t)
+"""
+    assert detect_rollouts({"x.py": patch}, wl, {}) == []
+
+
+def test_method_discriminator_falls_back_to_legacy_for_single_method_group():
+    """When all entries in a shared-short group are for the same method
+    (shouldn't happen post-`_dedupe_kwarg_overrides`, but cross-commit
+    overrides can produce it), legacy first-wins behavior preserves the
+    pre-discriminator semantics."""
+    wl = Watchlist()
+    _seed_kwarg(wl, "odoo.orm.fields.Field.to_sql.table")
+    _seed_kwarg(wl, "odoo.orm.fields_other.Other.to_sql.table")
+    patch = """\
+--- a/x.py
++++ b/x.py
+@@ -1,1 +1,2 @@
+ a = 1
++    self.to_sql(table=t)
+"""
+    records = detect_rollouts({"x.py": patch}, wl, {})
+    assert len(records) == 1
+    # Alphabetically-first symbol wins, as with the historical dedupe.
+    assert records[0].symbol == "odoo.orm.fields.Field.to_sql.table"
+
+
 def test_watchlist_from_dict_backward_compat_missing_element():
     """Existing watchlist.json files predate the `element` field - they
     should load cleanly with element=None."""

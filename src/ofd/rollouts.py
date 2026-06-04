@@ -7,7 +7,17 @@ slide example.
 
 A naive `short_name in line` match produces huge false-positive rates
 for generic names like `join`, `default`, `help`. The pipeline applies
-three filtering stages, in order:
+four filtering stages, in order:
+
+0. Language gate (`_file_language` + `_KIND_LANGUAGES`). Files whose
+   extension isn't in `_FILE_LANGUAGES` (.py, .xml, .rng) are skipped
+   wholesale - we don't extract primitives from .js / .po / .csv /
+   .html, so a Python primitive matching `setup()` on every OWL
+   component or a context-key name appearing as a JS Record field is a
+   pure cross-language false positive. Within a scanned file, entries
+   whose source language doesn't include this file's language are
+   dropped (NEW_KWARG `compute_sql` doesn't fire in XML; NEW_VIEW_*
+   doesn't fire in .py).
 
 1. Aho-Corasick prefilter (`_Matcher.automaton`). One pass over the
    patch reports which watchlisted short names are present. Replaces
@@ -42,14 +52,17 @@ qualifier can't structurally distinguish `Many2many.join(...)` from
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
+from enum import StrEnum
 from functools import lru_cache
 
 import ahocorasick
 from ast_grep_py import SgRoot
+from lxml import etree
 
 from ofd.events.record import ChangeRecord, Kind
-from ofd.watchlist import Watchlist
+from ofd.watchlist import Watchlist, WatchlistEntry
 
 _HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@.*$")
 
@@ -76,27 +89,68 @@ _RELAX_GENERIC_KINDS = frozenset({
     Kind.NEW_PUBLIC_CLASS,
 })
 
-# Kinds whose adoption shape is Python-only - matching them in XML/RNG
-# files is a pure error mode (a NEW_KWARG entry like `Many2one.join.kind`
-# is not an XML attribute, even if a `<button kind="primary"/>` happens
-# to share the short name).
-_PYTHON_ONLY_KINDS = frozenset({
+# Source language of a primitive's adoption surface. Drives which file
+# extensions we even open looking for a rollout.
+class Language(StrEnum):
+    PY = "py"      # Python source (.py)
+    VIEW = "view"  # XML / RNG view source (.xml, .rng)
+
+
+# Languages each primitive kind can legitimately adopt in. A diff file's
+# language must be in the kind's set, otherwise the entry is dropped
+# before we ever run the contextual regex - the cheapest way to kill
+# whole classes of cross-language false positives (an OWL `setup()` is
+# not an adoption of `PropertiesDefinition.setup`; a JS Record's
+# `partner_id = fields.One(...)` is not a `partner_id` context-key use).
+#
+# - PY-only kinds: NEW_KWARG/SIGNATURE_CHANGE never appear in XML; XML
+#   has no kwargs or call signatures. NEW_CONTEXT_KEY is PY-only because
+#   most context keys collide with model field names and `<field
+#   name="employee_id"/>` is a field reference, not an adoption.
+# - PY+VIEW kinds: a class / helper / class-attribute *name* can leak
+#   into XML as a string (`<field name="formatted_display_name"/>`,
+#   QWeb `record.formatted_display_name`). Generic short names in this
+#   group are blocked from VIEW separately by `_GENERIC_BLOCKED_IN_VIEW`.
+# - VIEW-only kinds: pure RNG-derived primitives.
+# - PY+VIEW for NEW_VIEW_TYPE: types like 'kanban' / 'list' get
+#   referenced both in Python action defs and XML view definitions.
+_KIND_LANGUAGES: dict[Kind, frozenset[Language]] = {
+    Kind.NEW_KWARG:                 frozenset({Language.PY}),
+    Kind.SIGNATURE_CHANGE:          frozenset({Language.PY}),
+    Kind.NEW_CONTEXT_KEY:           frozenset({Language.PY}),
+    Kind.NEW_ENDPOINT:              frozenset({Language.PY}),
+    Kind.DEPRECATION_WARNING_ADDED: frozenset({Language.PY}),
+    Kind.REMOVED_PUBLIC_SYMBOL:     frozenset({Language.PY}),
+    Kind.NEW_PUBLIC_CLASS:          frozenset({Language.PY, Language.VIEW}),
+    Kind.NEW_DECORATOR_OR_HELPER:   frozenset({Language.PY, Language.VIEW}),
+    Kind.NEW_CLASS_ATTRIBUTE:       frozenset({Language.PY, Language.VIEW}),
+    Kind.NEW_VIEW_TYPE:             frozenset({Language.PY, Language.VIEW}),
+    Kind.NEW_VIEW_ATTRIBUTE:        frozenset({Language.VIEW}),
+    Kind.NEW_VIEW_ELEMENT:          frozenset({Language.VIEW}),
+    Kind.NEW_VIEW_DIRECTIVE:        frozenset({Language.VIEW}),
+    Kind.REMOVED_VIEW_ATTRIBUTE:    frozenset({Language.VIEW}),
+}
+
+# PY+VIEW kinds where a *generic* short name (in `_GENERIC_SHORT_NAMES`)
+# is too dangerous to allow in VIEW scope. A NEW_DECORATOR_OR_HELPER
+# called `name` would match every `<field name=.../>` in the tree; the
+# specific-name case (`formatted_display_name`) is still allowed.
+_GENERIC_BLOCKED_IN_VIEW: frozenset[Kind] = frozenset({
     Kind.NEW_PUBLIC_CLASS,
     Kind.NEW_DECORATOR_OR_HELPER,
     Kind.NEW_CLASS_ATTRIBUTE,
-    Kind.NEW_KWARG,
-    Kind.SIGNATURE_CHANGE,
 })
 
-# Kinds skipped in XML scope for *every* short name, generic or specific.
-# Most context keys (`employee_id`, `partner_id`, `company`, `lang`, ...)
-# share names with Odoo model fields, and XML views reference fields by
-# name (`<field name="employee_id"/>`). The rollout regex's
-# quoted-string alternative can't distinguish "context-key reference"
-# from "field name", so the only safe XML behavior is to skip entirely.
-_XML_BLOCKLIST_KINDS = frozenset({
-    Kind.NEW_CONTEXT_KEY,
-})
+# File extension -> language. Files outside this map (.js, .po, .csv,
+# .html, .scss, ...) are skipped wholesale. We don't extract primitives
+# from those formats, and matching Python/View primitives there has
+# only produced false positives in the wild (the entire JS rollout
+# column of `PropertiesDefinition.setup` and `Transaction.cache` was
+# bogus - OWL lifecycle methods and unrelated `cache` properties).
+_FILE_LANGUAGES: tuple[tuple[tuple[str, ...], Language], ...] = (
+    ((".py",), Language.PY),
+    ((".xml", ".rng"), Language.VIEW),
+)
 
 # Names that alias too many unrelated builtins / common idioms to be
 # matched outside an explicit import. Hand-curated; extend cautiously.
@@ -126,6 +180,26 @@ _GENERIC_SHORT_NAMES: frozenset[str] = frozenset({
 
 
 @lru_cache(maxsize=512)
+def _directive_pattern(name: str) -> re.Pattern[str]:
+    """Pattern for NEW_VIEW_DIRECTIVE rollouts.
+
+    A directive primitive declares "element X may now contain child
+    element Y" (or accept ref Y). Adoption surface is a `<Y>` opening
+    tag in a view, not an attribute. Pre-fix, the shared element-scoped
+    pattern compiled to `<X\\b[^<]*?\\bY\\s*=` - looking for `Y=` as an
+    attribute on `<X>`, which is the wrong shape and fired ~never.
+
+    Now we look for the child opening tag directly. The language gate
+    already restricts scanning to `.xml` / `.rng` so the FP surface is
+    narrow; if a directive's tag name collides with an unrelated
+    element used in other XML contexts (e.g. reports), the future
+    `required_ancestor` annotation can tighten this further.
+    """
+    n = re.escape(name)
+    return re.compile(rf"<{n}\b")
+
+
+@lru_cache(maxsize=512)
 def _context_key_pattern(name: str) -> re.Pattern[str]:
     """Tighter pattern for NEW_CONTEXT_KEY adoption.
 
@@ -142,10 +216,11 @@ def _context_key_pattern(name: str) -> re.Pattern[str]:
       - kwarg-style `NAME=` (covers `with_context(NAME=value)` plus
         local-var assignments which the .py qualifier filters out)
 
-    Same pattern across all file scopes - .xml entries are dropped at
-    the matcher level by `_XML_BLOCKLIST_KINDS`, .py and .py_other use
-    this pattern; .py also runs the ast-grep qualifier which rejects
-    bare-attribute and identifier matches structurally.
+    Used only in the PY scope - context keys are PY-only by
+    `_KIND_LANGUAGES` (XML namespace collision with model field names is
+    too high), so we never compile a VIEW pattern for them. The .py
+    qualifier still runs on top to reject bare-attribute and identifier
+    matches structurally.
     """
     n = re.escape(name)
     return re.compile(
@@ -164,12 +239,17 @@ def _contextual_pattern(
     """Build a regex matching `name` only in meaningful contexts.
 
     `file_scope` selects the alternatives we care about:
-      - "py"  (default): 11 Python/JS-compatible forms (attribute access,
-        call, kwarg, import, class, def, decorator, annotation, quoted
-        string) - handles most adoption shapes across .py / .js.
+      - "py"  (default): 11 Python forms (attribute access, call, kwarg,
+        import, class, def, decorator, annotation, quoted string) -
+        handles most adoption shapes inside .py source.
       - "xml": 3 forms (quoted strings + `name="value"` attribute form).
         Skips the Python-specific alternatives entirely, cutting regex
         cost ~6x per call on XML blobs in benchmarks.
+      - "py_other": import-only gate. Used internally as a fallback
+        for generic-named entries on .py files where the structural
+        qualifier can't disambiguate (NEW_DECORATOR_OR_HELPER `join`
+        looks identical to `",".join(items)`); no file path resolves
+        to this scope directly anymore.
 
     Generic names (`_GENERIC_SHORT_NAMES`) used to be restricted to
     *import* statements only - the regex on its own can't tell `kind=lazy`
@@ -177,11 +257,6 @@ def _contextual_pattern(
     local var). With `file_scope == "py"`, the structural ast-grep
     qualifier in `_ast_qualifies` handles that disambiguation, so the
     regex runs the full pattern and the qualifier filters.
-
-    For `file_scope == "py_other"` (.js, .po, .csv, .html, ...) the
-    qualifier can't help (we only parse Python), so we keep the
-    import-only gate. Without it, a .po file containing English text
-    like `msgid "kind of weird"` matches every generic name.
 
     If `element` is given (RNG-derived view-attribute entry), restrict
     matches to XML attributes on that specific parent element. Without
@@ -368,6 +443,70 @@ def _specific_rule(name: str) -> dict:
         {"kind": "identifier", "regex": name_re},
         {"kind": "string_content", "regex": name_re},
     ]}}
+
+
+@lru_cache(maxsize=2048)
+def _kwarg_in_method_rule(kwarg: str, method: str) -> dict:
+    """ast-grep rule: a `keyword_argument` named `kwarg` whose enclosing
+    call's function is exactly `method` (bare `method(...)` or
+    `obj.method(...)`).
+
+    Used to disambiguate NEW_KWARG entries that share a short name
+    across different methods - e.g. `Field.to_sql.table` and
+    `Field.condition_to_sql.table` both pre-filter on `table` via
+    Aho-Corasick, but only one is the right attribution for any given
+    call site. Without this, the matcher's per-hunk dedupe sends every
+    `table=` adoption to whichever entry sorts first alphabetically
+    (`condition_to_sql` < `to_sql`), so `to_sql(table=...)` adoptions
+    show as zero-rollout shadows.
+    """
+    kwarg_re = f"^{re.escape(kwarg)}$"
+    method_re = f"^{re.escape(method)}$"
+    return {"rule": {
+        "kind": "keyword_argument",
+        "all": [
+            {"has": {"field": "name", "regex": kwarg_re, "stopBy": "end"}},
+            {"inside": {
+                "kind": "call",
+                "has": {"field": "function",
+                        "any": [
+                            {"kind": "identifier", "regex": method_re},
+                            {"kind": "attribute",
+                             "has": {"field": "attribute", "regex": method_re,
+                                     "stopBy": "end"}},
+                        ],
+                        "stopBy": "end"},
+                "stopBy": "end",
+            }},
+        ],
+    }}
+
+
+def _kwarg_method_targets(group: list[WatchlistEntry]) -> list[str] | None:
+    """Method names from a group of NEW_KWARG entries that share a
+    short name, or None if the group can't be method-discriminated.
+
+    Returns None when:
+      - the group has zero or one entry (single method, no choice to
+        make, cheaper to use the legacy path)
+      - any entry isn't a NEW_KWARG (mixed groups fall back to legacy)
+      - any symbol doesn't have the `<...>.<class>.<method>.<kwarg>`
+        shape (need at least 4 segments to extract a method name)
+      - all entries have the same method (no discrimination needed)
+    """
+    if len(group) < 2:
+        return None
+    methods: list[str] = []
+    for e in group:
+        if e.kind is not Kind.NEW_KWARG or not e.symbol:
+            return None
+        parts = e.symbol.split(".")
+        if len(parts) < 4:
+            return None
+        methods.append(parts[-2])
+    if len(set(methods)) < 2:
+        return None
+    return methods
 
 
 @lru_cache(maxsize=512)
@@ -610,6 +749,56 @@ def _ast_qualifies(root, kind: Kind, name: str) -> bool:
     return _has_truncated_identifier(root, name)
 
 
+def _ancestor_qualifies(
+    xml_root: etree._Element | None,
+    entry: WatchlistEntry,
+) -> bool:
+    """Confirm at least one matching XML element in the file has an
+    ancestor whose tag is in `entry.required_ancestor`.
+
+    Caller passes the parsed child-source root (or None on parse
+    failure). On None we reject conservatively - the user opted into
+    structural matching, so "can't verify" should mean "don't emit"
+    rather than letting through a possible false positive.
+
+    The element to look for depends on kind:
+      - NEW_VIEW_DIRECTIVE: `entry.short_name` is the child tag itself
+        (e.g. `column`); we look for any `<column>` element.
+      - NEW_VIEW_ATTRIBUTE: `entry.element` is the host tag (e.g.
+        `widget`) and `entry.short_name` is the attribute (e.g.
+        `invisible`); we look for `<widget>` elements that carry the
+        `invisible` attribute.
+    Other kinds aren't VIEW-scoped so they shouldn't reach this path,
+    but we conservatively reject if invoked.
+    """
+    if not entry.required_ancestor:
+        return True
+    if xml_root is None:
+        return False
+    if entry.kind is Kind.NEW_VIEW_DIRECTIVE:
+        target_tag = entry.short_name
+        require_attr: str | None = None
+    elif entry.kind is Kind.NEW_VIEW_ATTRIBUTE:
+        target_tag = entry.element or entry.short_name
+        require_attr = entry.short_name
+    else:
+        return False
+    allowed = {a for a in entry.required_ancestor}
+    for el in xml_root.iter():
+        if not isinstance(el.tag, str):
+            continue
+        if etree.QName(el).localname != target_tag:
+            continue
+        if require_attr is not None and require_attr not in el.attrib:
+            continue
+        for ancestor in el.iterancestors():
+            if not isinstance(ancestor.tag, str):
+                continue
+            if etree.QName(ancestor).localname in allowed:
+                return True
+    return False
+
+
 @dataclass(frozen=True)
 class _Matcher:
     """Pre-built rollout matcher for a given watchlist snapshot.
@@ -621,7 +810,7 @@ class _Matcher:
 
     `compiled_by_scope` holds per-(symbol, file_scope) patterns so an
     XML rollout pays a ~6x cheaper regex than the full Python-shaped
-    pattern would charge.
+    pattern would charge. Scope keys mirror `Language` values.
 
     `automaton` is an Aho-Corasick automaton over the short names. One
     O(|text|) pass reports which watchlisted short names are present,
@@ -634,53 +823,67 @@ class _Matcher:
     automaton: ahocorasick.Automaton
 
 
-def _file_scope(path: str) -> str:
-    """Pick the narrowest contextual-pattern scope that still covers
-    the adoption shapes we care about in this file type.
+def _file_language(path: str) -> Language | None:
+    """Map a file path to the language we'll interpret it as, or None
+    to skip the file entirely.
 
-    `.py` files get the relaxed pattern (qualifier filters generic-name
-    noise downstream). Other py-shaped files (.js, .po, .csv, .html,
-    ...) get `py_other` which keeps the import-only generic-name gate -
-    the qualifier only parses Python and can't help here.
+    Skipping (returning None) is what kills the cross-language FP class:
+    we don't run Python/View regexes against `.js` / `.po` / `.css`
+    files at all. The contextual regex's `py_other` scope is preserved
+    internally for the strict-on-py fallback (generic-named decorator
+    helpers like `join` keep the import-only gate even on .py files),
+    but no file path resolves to it any more.
     """
-    if path.endswith((".xml", ".rng")):
-        return "xml"
-    if path.endswith(".py"):
-        return "py"
-    return "py_other"
+    for exts, lang in _FILE_LANGUAGES:
+        if path.endswith(exts):
+            return lang
+    return None
 
 
 def _build_matcher(watchlist: Watchlist) -> _Matcher:
     by_short: dict[str, list] = {}
     for entry in sorted(watchlist.entries.values(), key=lambda e: e.symbol):
         by_short.setdefault(entry.short_name, []).append(entry)
+    # Only PY and VIEW scopes - non-source files are dropped before
+    # we look up a pattern (see `_file_language`).
     compiled_by_scope: dict[str, dict[str, re.Pattern[str]]] = {
-        "py": {}, "py_other": {}, "xml": {},
+        Language.PY: {}, Language.VIEW: {},
     }
     for entry in watchlist.entries.values():
-        # Context keys get a dedicated tight pattern across all scopes
-        # to reject the `.attribute` form on shared-name model fields
-        # (`obj.employee_id`, `self.env.company`). XML scope entries
-        # are also dropped at match time by `_XML_BLOCKLIST_KINDS`.
+        # Context keys get a dedicated tight pattern (rejects the bare
+        # `.attribute` form on shared-name model fields). They're PY-only
+        # by `_KIND_LANGUAGES`, so we don't compile a VIEW pattern.
         if entry.kind is Kind.NEW_CONTEXT_KEY:
-            ck_pattern = _context_key_pattern(entry.short_name)
-            for scope in ("py", "py_other", "xml"):
-                compiled_by_scope[scope][entry.symbol] = ck_pattern
+            compiled_by_scope[Language.PY][entry.symbol] = _context_key_pattern(
+                entry.short_name,
+            )
+            continue
+        # Directive entries declare a new child element under a parent.
+        # Adoption is a `<child>` opening tag, not an attribute on the
+        # parent - so they get the directive pattern instead of the
+        # element-scoped attribute one. VIEW-only by _KIND_LANGUAGES.
+        if entry.kind is Kind.NEW_VIEW_DIRECTIVE:
+            compiled_by_scope[Language.VIEW][entry.symbol] = _directive_pattern(
+                entry.short_name,
+            )
             continue
         module = _module_path_of(entry.symbol)
         # Generic-named entries whose kind has no discriminating qualifier
         # rule (e.g. NEW_DECORATOR_OR_HELPER `join`) keep the import-only
         # gate even on .py files - the qualifier would let every
-        # `",".join(items)` through.
+        # `",".join(items)` through. The "py_other" scope of the
+        # contextual pattern carries that strict shape.
         keep_strict_on_py = (
             entry.short_name in _GENERIC_SHORT_NAMES
             and entry.kind not in _RELAX_GENERIC_KINDS
         )
-        for scope in ("py", "py_other", "xml"):
-            effective = "py_other" if (scope == "py" and keep_strict_on_py) else scope
-            compiled_by_scope[scope][entry.symbol] = _contextual_pattern(
-                entry.short_name, module, entry.element, effective,
-            )
+        py_scope = "py_other" if keep_strict_on_py else "py"
+        compiled_by_scope[Language.PY][entry.symbol] = _contextual_pattern(
+            entry.short_name, module, entry.element, py_scope,
+        )
+        compiled_by_scope[Language.VIEW][entry.symbol] = _contextual_pattern(
+            entry.short_name, module, entry.element, "xml",
+        )
     automaton = ahocorasick.Automaton()
     for short in by_short:
         automaton.add_word(short, short)
@@ -700,11 +903,18 @@ def _cached_matcher(watchlist: Watchlist) -> _Matcher:
 
     Key includes `element` per entry so the fix for RNG-scoped
     primitives isn't silently invalidated by a cache hit on an older
-    signature. Cached keys are monotonic in practice (watchlist only
+    signature, and `required_ancestor` so an annotation update isn't
+    masked by an old `by_short` pointing at the pre-annotation entry
+    object. Cached keys are monotonic in practice (watchlist only
     grows during a run), so the cache doesn't need bounds.
     """
     key = frozenset(
-        (e.symbol, e.element) for e in watchlist.entries.values()
+        (
+            e.symbol,
+            e.element,
+            tuple(e.required_ancestor) if e.required_ancestor else None,
+        )
+        for e in watchlist.entries.values()
     )
     cached = _MATCHER_CACHE.get(key)
     if cached is None:
@@ -717,6 +927,7 @@ def detect_rollouts(
     patches: dict[str, str],
     watchlist: Watchlist,
     child_sources: dict[str, str | None] | None = None,
+    fetch_child: Callable[[str], str | None] | None = None,
 ) -> list[ChangeRecord]:
     """Scan patches for rollouts of watchlisted short names.
 
@@ -724,11 +935,37 @@ def detect_rollouts(
       patches: file -> unified diff patch for that file.
       watchlist: current watchlist (short_name -> symbol).
       child_sources: optional map file -> full child source, used to pull
-        _name / _inherit for rollouts on Odoo model files.
+        _name / _inherit for rollouts on Odoo model files. Also reused
+        for the structural ancestor check on annotated VIEW entries.
+      fetch_child: optional callback to lazily load a file's child source
+        when an annotated VIEW entry needs it for the ancestor check
+        and the file isn't already in `child_sources`. Cheaper than
+        pre-fetching every hit candidate; the historical perf wisdom
+        was that pre-fetching cost ~85% of runtime.
     """
     records: list[ChangeRecord] = []
     if not watchlist.entries:
         return records
+    # Per-call cache of parsed XML roots, keyed by file path. Only built
+    # for files where an entry actually requires the structural check.
+    parsed_xml: dict[str, etree._Element | None] = {}
+
+    def _xml_root_for(file: str) -> etree._Element | None:
+        if file in parsed_xml:
+            return parsed_xml[file]
+        src = (child_sources or {}).get(file)
+        if src is None and fetch_child is not None:
+            src = fetch_child(file)
+            if child_sources is not None and src is not None:
+                child_sources[file] = src
+        if not src:
+            parsed_xml[file] = None
+            return None
+        try:
+            parsed_xml[file] = etree.fromstring(src.encode("utf-8"))
+        except etree.XMLSyntaxError:
+            parsed_xml[file] = None
+        return parsed_xml[file]
 
     # Shared-name primitives (e.g. a new kwarg `compute_sql` added to
     # 10 Field subclasses) dedupe to one rollout per hunk, attributed
@@ -754,6 +991,14 @@ def detect_rollouts(
         )
 
     for file, patch in patches.items():
+        # File-level language gate. Files outside `_FILE_LANGUAGES`
+        # (.js, .po, .csv, .html, .scss, ...) are skipped wholesale: we
+        # don't extract primitives from them, so any match would be a
+        # cross-language false positive (the OWL `setup()` lifecycle
+        # method is not an adoption of `PropertiesDefinition.setup`).
+        file_lang = _file_language(file)
+        if file_lang is None:
+            continue
         # File-level early exit: short-circuit AC iter on the first hit.
         # Replaces a `\b(a|b|...)\b` regex whose cost grew with watchlist
         # size; the iter stops at the first match, so the no-match case
@@ -761,10 +1006,9 @@ def detect_rollouts(
         # cost is gone.
         if next(automaton.iter(patch), None) is None:
             continue
-        scope = _file_scope(file)
-        compiled = matcher.compiled_by_scope[scope]
-        is_py = file.endswith(".py")
-        is_xml = scope == "xml"
+        compiled = matcher.compiled_by_scope[file_lang]
+        is_py = file_lang is Language.PY
+        is_view = file_lang is Language.VIEW
         for hunk in _parse_patch(patch):
             added_blob = _strip_comments("\n".join(hunk.raw_added))
             if not added_blob.strip():
@@ -793,30 +1037,25 @@ def detect_rollouts(
             for short, group in by_short.items():
                 if short not in present_shorts:
                     continue
-                # On XML/RNG files, drop:
-                #   - Python-only kinds with generic short names
-                #     (NEW_KWARG `kind` was firing on
-                #     `<button kind="primary"/>`)
-                #   - any kind in the XML blocklist (currently
-                #     NEW_CONTEXT_KEY: most context keys share names
-                #     with model fields, so `<field name="employee_id"/>`
-                #     is a model-field reference, not a context-key
-                #     adoption - the regex can't tell them apart)
-                # Specific names in other Python-only kinds
-                # (`formatted_display_name` magic strings,
-                # `CachedModel` class refs) legitimately appear as XML
-                # attribute values / template references, so they stay.
-                if is_xml:
-                    group = [
-                        e for e in group
-                        if e.kind not in _XML_BLOCKLIST_KINDS
-                        and not (
-                            e.kind in _PYTHON_ONLY_KINDS
-                            and e.short_name in _GENERIC_SHORT_NAMES
-                        )
-                    ]
-                    if not group:
-                        continue
+                # Drop entries whose source language doesn't include
+                # this file's language (the bulk of the cross-language
+                # FP class). Then, in VIEW scope, additionally drop
+                # generic-named entries from the cross-language kinds
+                # (a NEW_DECORATOR_OR_HELPER `name` would match every
+                # `<field name=.../>` even though the entry can
+                # legitimately appear in XML when the name is specific
+                # like `formatted_display_name`).
+                group = [
+                    e for e in group
+                    if file_lang in _KIND_LANGUAGES[e.kind]
+                    and not (
+                        is_view
+                        and e.kind in _GENERIC_BLOCKED_IN_VIEW
+                        and e.short_name in _GENERIC_SHORT_NAMES
+                    )
+                ]
+                if not group:
+                    continue
                 if any(e.element is not None for e in group):
                     # Per-entry matching: each entry's pattern is
                     # context-specific (parent element differs), so a
@@ -830,6 +1069,27 @@ def detect_rollouts(
                                 ast_root = SgRoot(added_blob, "python").root()
                             if not _ast_qualifies(ast_root, entry.kind, entry.short_name):
                                 continue
+                        if entry.required_ancestor:
+                            if not _ancestor_qualifies(_xml_root_for(file), entry):
+                                continue
+                        records.append(_make_record(file, hunk, entry))
+                elif is_py and (methods := _kwarg_method_targets(group)) is not None:
+                    # NEW_KWARG entries share the same short name across
+                    # different methods (e.g. `Field.to_sql.table` vs
+                    # `Field.condition_to_sql.table`). The contextual
+                    # regex can't tell them apart, so we discriminate
+                    # at the AST level: only attribute the rollout to
+                    # the entry whose method actually appears at the
+                    # call site of the kwarg. Multiple entries can fire
+                    # on the same hunk if both methods are called there.
+                    if not compiled[group[0].symbol].search(added_blob):
+                        continue
+                    if ast_root is None:
+                        ast_root = SgRoot(added_blob, "python").root()
+                    for entry, method in zip(group, methods, strict=True):
+                        rule = _kwarg_in_method_rule(entry.short_name, method)
+                        if not ast_root.find_all(rule):
+                            continue
                         records.append(_make_record(file, hunk, entry))
                 else:
                     # Shared short name, no element context -> all
@@ -842,6 +1102,9 @@ def detect_rollouts(
                         if ast_root is None:
                             ast_root = SgRoot(added_blob, "python").root()
                         if not _ast_qualifies(ast_root, first.kind, first.short_name):
+                            continue
+                    if first.required_ancestor:
+                        if not _ancestor_qualifies(_xml_root_for(file), first):
                             continue
                     records.append(_make_record(file, hunk, first))
     return records

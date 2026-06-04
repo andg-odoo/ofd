@@ -121,3 +121,16 @@ def test_show_cli_path_flag(tmp_path: Path):
     )
     assert result.exit_code == 0
     assert "odoo.orm.CachedModel.md" in result.output
+
+
+def test_show_cli_no_pager_flag_accepted(tmp_path: Path):
+    """`--no-pager` is the escape hatch for the pager-by-default behavior;
+    with stdout piped (the CliRunner case), the pager branch is bypassed
+    anyway, so this just verifies the flag is wired and doesn't crash."""
+    _write_entry(tmp_path, "new-apis", "odoo.orm.CachedModel", body_extra="x")
+    runner = CliRunner()
+    result = runner.invoke(
+        show, ["--workspace", str(tmp_path), "--no-pager", "CachedModel"]
+    )
+    assert result.exit_code == 0
+    assert "odoo.orm.CachedModel" in result.output

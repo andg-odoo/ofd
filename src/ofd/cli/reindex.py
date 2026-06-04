@@ -52,11 +52,17 @@ def reindex(
     if watchlist_changed:
         wl = watchlist_mod.load(workspace)
     else:
-        # Fresh watchlist - but carry forward manual pins, since their
-        # definitions aren't discoverable by the extractors.
+        # Fresh watchlist - but carry forward manual pins (definitions
+        # the extractors can't see) and entries with user annotations
+        # like `required_ancestor` (extractor will re-add the entry, but
+        # its annotation lives only in the watchlist file and would
+        # otherwise be wiped). `add_from_definition` is idempotent on
+        # symbol, so a re-extracted definition won't overwrite either.
         existing = watchlist_mod.load(workspace)
         wl = watchlist_mod.Watchlist()
         for entry in existing.manual_entries():
+            wl.entries[entry.symbol] = entry
+        for entry in existing.annotated_entries():
             wl.entries[entry.symbol] = entry
 
     _apply_since_overrides(state, config, since_overrides)

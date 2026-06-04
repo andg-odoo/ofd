@@ -77,6 +77,50 @@ class Model:
     assert helpers[0].symbol == "odoo.models.base.Model.search_count"
 
 
+def test_new_dunder_method_filtered_at_extraction():
+    """Adding `__repr__` / `__eq__` / `__set_name__` etc. to a class is
+    plumbing, not new API. The extractor used to emit them as
+    NEW_DECORATOR_OR_HELPER primitives that piled up as zero-rollout
+    ledger noise; now they're suppressed. `__init__` and `__new__`
+    are explicitly NOT filtered - those reshape the construction
+    surface and their kwarg changes are real API."""
+    parent = '''\
+class Origin:
+    pass
+'''
+    child = '''\
+class Origin:
+    def __repr__(self): return ""
+    def __eq__(self, other): return False
+    def __hash__(self): return 0
+    def __set_name__(self, owner, name): pass
+    def search(self, domain): pass
+'''
+    records = extract(parent, child, "odoo/orm/x.py")
+    helpers = [r for r in records if r.kind == Kind.NEW_DECORATOR_OR_HELPER]
+    symbols = {r.symbol for r in helpers}
+    # Only the non-dunder method comes through.
+    assert symbols == {"odoo.orm.x.Origin.search"}
+
+
+def test_new_init_dunder_still_emitted():
+    """`__init__` and `__new__` are real construction-surface changes -
+    keep them visible at the definition layer."""
+    parent = '''\
+class Thing:
+    pass
+'''
+    child = '''\
+class Thing:
+    def __init__(self, foo): pass
+    def __new__(cls, *a, **kw): return super().__new__(cls)
+'''
+    records = extract(parent, child, "odoo/orm/x.py")
+    helpers = [r for r in records if r.kind == Kind.NEW_DECORATOR_OR_HELPER]
+    symbols = {r.symbol for r in helpers}
+    assert symbols == {"odoo.orm.x.Thing.__init__", "odoo.orm.x.Thing.__new__"}
+
+
 def test_removed_public_symbol():
     parent = '''\
 class Old:
