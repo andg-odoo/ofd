@@ -166,11 +166,31 @@ repos:
       - odoo/addons/base/rng/*.rng
       - odoo/addons/web/static/src/core/**
       - odoo/addons/web/static/src/views/**
+      - odoo/addons/web/static/src/search/**
+      - odoo/addons/web/static/src/webclient/**
+      # The second framework: mail mixins. Python only - mail's JS
+      # stays ungated on purpose so discuss keeps counting as an
+      # adopter (gated files are excluded from the rollout scan).
+      - odoo/addons/mail/models/**/*.py
+      # Payment-provider framework surface.
+      - odoo/addons/payment/models/**/*.py
+      - odoo/addons/payment/controllers/**/*.py
+      - odoo/addons/payment/*.py
+      # The editor/builder plugin frameworks.
+      - odoo/addons/html_editor/static/src/**
+      - odoo/addons/html_builder/static/src/**
+    # Definitions here surface as events but never join the rollout
+    # watchlist (migration helpers aren't adoptable APIs).
+    surface_only_paths:
+      - odoo/upgrade_code/**
+      - odoo/cli/**
     core_paths:
       - odoo/models/**/*.py
       - odoo/fields.py
       - odoo/api.py
       - odoo/orm/**/*.py
+  # Order matters: repos with framework_paths build the watchlist in
+  # config order, so the defining repo must precede adopter-heavy ones.
   enterprise:
     source: git@github.com:odoo/enterprise.git
     mirror: ~/.cache/ofd/enterprise.git
