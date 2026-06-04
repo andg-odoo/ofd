@@ -73,13 +73,17 @@ def test_export_diff_removed():
     assert records[0].symbol == "@web/core/x.helper"
 
 
-def test_export_rename_folds_to_signature_change():
+def test_export_rename_is_removal_plus_addition():
+    # Rename folding existed in phase 1 but never fired on the real
+    # corpus and was deleted per DESIGN-js.md's own rule; a rename is
+    # now an honest removal + addition pair.
     parent = "export function oldName(a) { return a + 1; }\n"
     child = "export function newName(a) { return a + 1; }\n"
     records = js_.extract(parent, child, "addons/web/static/src/core/x.js")
-    assert [r.kind for r in records] == [Kind.SIGNATURE_CHANGE]
-    assert records[0].symbol == "@web/core/x.newName"
-    assert "oldName" in records[0].symbol_hint
+    assert sorted((r.kind, r.symbol) for r in records) == [
+        (Kind.NEW_JS_EXPORT, "@web/core/x.newName"),
+        (Kind.REMOVED_JS_EXPORT, "@web/core/x.oldName"),
+    ]
 
 
 def test_export_diff_unchanged_is_silent():

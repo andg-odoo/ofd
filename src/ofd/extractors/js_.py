@@ -1,15 +1,14 @@
 """JS extractor: export diff, registry scan, vendored-lib version sniff.
 
-Phase 1 of DESIGN-js.md - definitions only. Three anchors:
+DESIGN-js.md anchors:
 
 - **Export diff** (framework paths, via the dispatcher): the JS mirror
   of `python_.py`. Parent->child diff of `export class` / `export
   function` / `export const` names in gated files. New exports are
   NEW_JS_EXPORT; removed ones are REMOVED_JS_EXPORT (removals are
-  deprecation stories). A removed export whose body reappears under a
-  new name in the same file folds into one SIGNATURE_CHANGE-style
-  rename event instead of a removal+addition pair (cheap insurance
-  against refactor churn; exact-body match only).
+  deprecation stories). Phase 1 shipped exact-body rename folding as
+  refactor-churn insurance; it never fired across the full 19,774-commit
+  reindex, so it was deleted per the spec's own rule.
 
 - **Registry scan** (wide scope, all repos, pipeline stage): the
   `registry.category("services").add("orm", ...)` call is the JS
@@ -37,11 +36,12 @@ writes: `addons/web/static/src/core/utils/hooks.js` exports
 `registry.<category>.<entry>`; short = last segment.
 
 CRITICAL INVARIANT (from documented false-positive history): all
-kinds emitted here are JS-specific and carry empty rollout-language
-sets in `rollouts._KIND_LANGUAGES`. Never let a Python/View kind match
-in JS scope or vice versa - the historical `PropertiesDefinition.setup`
-/ `Transaction.cache` rollout columns were exactly that failure.
-Phase 2 (import-anchored adoption matching) is bench-gated.
+kinds emitted here are JS-specific. NEW_JS_EXPORT adopts via
+import-anchored matching in JS scope only (phase 2,
+`rollouts._js_import_pattern`); registry and lib-bump kinds carry
+empty rollout-language sets. Never let a Python/View kind match in JS
+scope or vice versa - the historical `PropertiesDefinition.setup` /
+`Transaction.cache` rollout columns were exactly that failure.
 """
 
 from __future__ import annotations
@@ -122,8 +122,7 @@ def module_alias(path: str) -> str | None:
 class _Export:
     name: str
     line: int
-    form: str         # "class" | "function" | "const"
-    body: str | None  # declaration body text, for rename folding
+    form: str  # "class" | "function" | "const"
 
 
 def _string_literal(node) -> str | None:
@@ -147,10 +146,10 @@ def _exports(source: str | None) -> dict[str, _Export]:
         return {}
     out: dict[str, _Export] = {}
 
-    def _record(name: str, line: int, form: str, body: str | None) -> None:
+    def _record(name: str, line: int, form: str) -> None:
         if name.startswith("_"):
             return
-        out.setdefault(name, _Export(name=name, line=line, form=form, body=body))
+        out.setdefault(name, _Export(name=name, line=line, form=form))
 
     for st in root.find_all(_EXPORT_RULE):
         # `export default <anything>` has no stable adopter-side name
@@ -163,17 +162,13 @@ def _exports(source: str | None) -> dict[str, _Export]:
             line = decl.range().start.line + 1
             if kind == "class_declaration":
                 name_node = decl.field("name")
-                body = decl.field("body")
                 if name_node is not None:
-                    _record(name_node.text(), line, "class",
-                            body.text() if body is not None else None)
+                    _record(name_node.text(), line, "class")
             elif kind in ("function_declaration",
                           "generator_function_declaration"):
                 name_node = decl.field("name")
-                body = decl.field("body")
                 if name_node is not None:
-                    _record(name_node.text(), line, "function",
-                            body.text() if body is not None else None)
+                    _record(name_node.text(), line, "function")
             elif kind in ("lexical_declaration", "variable_declaration"):
                 for d in decl.children():
                     if d.kind() != "variable_declarator":
@@ -181,13 +176,7 @@ def _exports(source: str | None) -> dict[str, _Export]:
                     name_node = d.field("name")
                     if name_node is None or name_node.kind() != "identifier":
                         continue  # destructuring exports: skip silently
-                    value = d.field("value")
-                    _record(
-                        name_node.text(),
-                        d.range().start.line + 1,
-                        "const",
-                        value.text() if value is not None else None,
-                    )
+                    _record(name_node.text(), d.range().start.line + 1, "const")
             continue
         # `export { a, b as c }` - bare re-export lists. Ones with a
         # `from "..."` source alias another module's symbol; skip those
@@ -203,7 +192,7 @@ def _exports(source: str | None) -> dict[str, _Export]:
                 name_node = spec.field("alias") or spec.field("name")
                 if name_node is not None:
                     _record(name_node.text(), spec.range().start.line + 1,
-                            "const", None)
+                            "const")
     return out
 
 
@@ -228,38 +217,8 @@ def extract(
     added = sorted(child.keys() - parent.keys())
     removed = sorted(parent.keys() - child.keys())
 
-    # Rename folding: a removed export whose body reappears verbatim
-    # under a new name is one rename event, not a removal+addition at
-    # 3+2. Exact-body match only; each body consumed at most once.
-    renames: list[tuple[str, str]] = []  # (old, new)
-    removed_by_body = {
-        parent[name].body: name
-        for name in removed
-        if parent[name].body
-    }
-    for name in added:
-        body = child[name].body
-        old = removed_by_body.get(body) if body else None
-        if old is not None:
-            renames.append((old, name))
-            del removed_by_body[body]
-    renamed_old = {old for old, _ in renames}
-    renamed_new = {new for _, new in renames}
-
     records: list[ChangeRecord] = []
-    for old, new in renames:
-        records.append(ChangeRecord(
-            kind=Kind.SIGNATURE_CHANGE,
-            file=file,
-            line=child[new].line,
-            symbol=f"{module}.{new}",
-            symbol_hint=f"renamed from {old}",
-            before_signature=f"export {parent[old].form} {old}",
-            after_signature=f"export {child[new].form} {new}",
-        ))
     for name in added:
-        if name in renamed_new:
-            continue
         exp = child[name]
         records.append(ChangeRecord(
             kind=Kind.NEW_JS_EXPORT,
@@ -270,8 +229,6 @@ def extract(
             signature=f"export {exp.form} {name}",
         ))
     for name in removed:
-        if name in renamed_old:
-            continue
         exp = parent[name]
         records.append(ChangeRecord(
             kind=Kind.REMOVED_JS_EXPORT,
