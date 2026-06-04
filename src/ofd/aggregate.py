@@ -117,6 +117,7 @@ def _module_of(file: str) -> str | None:
 def build_primitives(
     workspace: Path,
     repo_names: list[str],
+    watchlist_entries: dict | None = None,
 ) -> dict[str, Primitive]:
     """Walk the raw event store for each repo and roll events into a
     symbol-keyed primitive map.
@@ -125,8 +126,15 @@ def build_primitives(
     its symbol. Subsequent definition events (polish commits on the same
     symbol) are appended to `definition_commits`. Rollout events target
     the symbol named on the rollout record.
+
+    `watchlist_entries` (symbol -> WatchlistEntry) lets rollout-only
+    stubs carry their pinned kind and version instead of a guess -
+    manual pins (`data-available-offline`) have no definition event,
+    so without it they render as `new_public_class` at whatever
+    version their first adopter happened to land in.
     """
     primitives: dict[str, Primitive] = {}
+    watchlist_entries = watchlist_entries or {}
 
     for repo in repo_names:
         for commit_record in iter_repo(workspace, repo):
@@ -174,11 +182,20 @@ def build_primitives(
                         # Rollout for a symbol we haven't seen a definition
                         # for yet (can happen on reindex or manual watchlist
                         # entry). Synthesize a stub primitive so we don't
-                        # drop the data.
+                        # drop the data; a watchlist entry (manual pin)
+                        # supplies the real kind and pinned version.
+                        wl_entry = watchlist_entries.get(change.symbol)
                         prim = Primitive(
                             symbol=change.symbol,
-                            kind=Kind.NEW_PUBLIC_CLASS,  # best guess
-                            active_version=commit_record.commit.active_version,
+                            kind=(
+                                wl_entry.kind if wl_entry is not None
+                                else Kind.NEW_PUBLIC_CLASS  # best guess
+                            ),
+                            active_version=(
+                                wl_entry.active_version
+                                if wl_entry is not None
+                                else commit_record.commit.active_version
+                            ),
                         )
                         primitives[change.symbol] = prim
                     prim.rollouts.append(RolloutOccurrence(

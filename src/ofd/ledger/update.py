@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from ofd import watchlist as watchlist_mod
 from ofd.aggregate import Primitive, build_primitives
 from ofd.config import Config
 from ofd.events.record import Kind
@@ -271,7 +272,10 @@ def update(
     deleting unrelated entries.
     """
     repo_names = [r.name for r in config.repos]
-    primitives = build_primitives(workspace, repo_names)
+    # Manual pins have no definition event; their watchlist entry
+    # supplies the stub's kind and pinned version.
+    wl = watchlist_mod.load(workspace)
+    primitives = build_primitives(workspace, repo_names, wl.entries)
     repo_links = _build_repo_links(config)
 
     written: list[Path] = []
