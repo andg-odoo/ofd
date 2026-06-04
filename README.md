@@ -100,7 +100,11 @@ Per commit on the tracked branch:
    primitive records the series it landed in (e.g. 19.2 vs 19.4).
 2. **Extract** framework-path files with the Python / RNG extractors.
    Emits definition events (new class, new kwarg, signature change,
-   deprecation, etc.).
+   deprecation, etc.). Two wide-scope extractors also run outside
+   framework paths: context keys (new `@api.depends_context(...)`
+   args anywhere) and file conventions (a previously-unseen data-file
+   basename added under `security/`/`data/` across ≥3 modules in one
+   commit, e.g. `ir.access.csv`; later adopters emit rollouts).
 3. **Watchlist update.** Every new definition adds its short name to
    the watchlist so later commits can be scanned for adoption.
 4. **Rollout scan.** Every non-gated changed file's diff is scanned for
@@ -142,6 +146,13 @@ Python extractor: `new_public_class`, `new_decorator_or_helper`,
 
 View-schema (RNG) extractor: `new_view_attribute`, `new_view_element`,
 `new_view_type`, `new_view_directive`, `removed_view_attribute`.
+
+Context-key extractor: `new_context_key`.
+
+File-convention detector: `new_file_convention` (path-shaped, not
+content-shaped - its rollouts are emitted by the detector itself when
+a module *adds* a file with the watchlisted basename; the content
+matcher never scans for it).
 
 Rollout detector: `rollout` (one per hit per hunk; carries before/after
 snippets for slide content).

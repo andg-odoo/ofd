@@ -89,6 +89,12 @@ class Watchlist:
             and not record.symbol.endswith("+shape")
         ):
             short = record.directive
+        # Convention symbols are dotted basenames (`ir.access.csv`), so
+        # the naive last segment is the bare extension - a short name
+        # that would match everywhere if its kind ever gained a rollout
+        # language. The basename IS the primitive; keep it whole.
+        if record.kind is Kind.NEW_FILE_CONVENTION:
+            short = record.symbol
         element = record.element if record.kind in _ELEMENT_SCOPED_KINDS else None
         entry = WatchlistEntry(
             symbol=record.symbol,

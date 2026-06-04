@@ -26,6 +26,7 @@ class Kind(StrEnum):
     NEW_VIEW_DIRECTIVE = "new_view_directive"
     REMOVED_VIEW_ATTRIBUTE = "removed_view_attribute"
     NEW_CONTEXT_KEY = "new_context_key"
+    NEW_FILE_CONVENTION = "new_file_convention"
     ROLLOUT = "rollout"
 
 
@@ -39,6 +40,7 @@ DEFINITION_KINDS = frozenset({
     Kind.NEW_VIEW_ELEMENT,
     Kind.NEW_VIEW_DIRECTIVE,
     Kind.NEW_CONTEXT_KEY,
+    Kind.NEW_FILE_CONVENTION,
 })
 """Kinds that introduce a watchlist-able primitive."""
 

@@ -192,6 +192,14 @@ def changed_files(mirror: Path, sha: str) -> list[str]:
     return [line for line in out.splitlines() if line]
 
 
+def ls_tree(mirror: Path, sha: str) -> list[str]:
+    """Every tracked file path at `sha` (recursive, names only)."""
+    out = _run(
+        ["git", "--git-dir", str(mirror), "ls-tree", "-r", "--name-only", sha]
+    )
+    return [line for line in out.splitlines() if line]
+
+
 def log_commits_with_files(
     mirror: Path,
     branch: str,

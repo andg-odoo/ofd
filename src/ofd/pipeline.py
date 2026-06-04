@@ -25,7 +25,7 @@ from ofd.config import Config, RepoConfig
 from ofd.events.record import ChangeRecord, CommitEnvelope, CommitRecord, Kind
 from ofd.events.store import raw_path
 from ofd.events.store import write as write_record
-from ofd.extractors import context_keys
+from ofd.extractors import context_keys, file_conventions
 from ofd.extractors.dispatcher import extract_for_file
 from ofd.globs import match_any
 from ofd.release_detect import detect_version, is_release_file
@@ -141,6 +141,7 @@ def process_commit(
     blob_fetcher: gitio.BlobFetcher | None = None,
     repo_state=None,
     baseline_context_keys: frozenset[str] | None = None,
+    baseline_conventions: frozenset[str] | None = None,
 ) -> CommitRecord | None:
     """Run extract + rollout + score for one commit. Returns a CommitRecord
     if any changes were found, else None. Does not persist - caller writes.
@@ -236,6 +237,25 @@ def process_commit(
                 parent_src, child_src, file,
                 baseline_keys=baseline_context_keys,
             ))
+
+    # --- stage 1.6: file-convention detection ---
+    # New data-file basenames (e.g. `security/ir.access.csv`) appearing
+    # across several modules at once. Candidate-gate on basename first -
+    # nearly every commit's data files carry baseline basenames - then
+    # confirm each survivor is an *added* file by checking its parent
+    # blob doesn't exist (the bulk log is --name-only; no status here).
+    conv_added: list[tuple[str, str, str]] = []
+    for file in all_files:
+        cand = file_conventions.candidate(file)
+        if cand is None:
+            continue
+        module, basename = cand
+        if baseline_conventions and basename in baseline_conventions:
+            continue
+        if _fetch(f"{sha}^", file) is None:
+            conv_added.append((file, module, basename))
+    if conv_added:
+        changes.extend(file_conventions.extract(conv_added, watchlist.entries))
 
     # Collapse same-commit override duplicates before they reach the
     # watchlist so they never become shadow entries in the first place.
@@ -352,6 +372,9 @@ def run_repo(
     # is suppressed at extraction time. Computed once per repo, cached
     # to disk by baseline SHA so re-runs skip the rescan.
     baseline_keys = _load_or_build_baseline_keys(repo, config, status_cb)
+    # Same idea for data-file basenames under security/ and data/:
+    # everything present at the floor is a known convention.
+    baseline_convs = _load_or_build_baseline_conventions(repo, config, status_cb)
 
     # Bulk-enumerate commits + their file lists in a single git call -
     # orders of magnitude faster than per-commit diff-tree when most
@@ -370,8 +393,16 @@ def run_repo(
             sha = info.sha
             touches_gated = any(_is_gated(f, repo.framework_paths) for f in changed)
             needs_rollout_scan = _any_rollout_candidate(changed, watchlist)
+            # Convention candidates are .csv/.xml data files - invisible
+            # to _any_rollout_candidate's extension check on .csv, so a
+            # pure mass-conversion commit needs its own gate.
+            needs_convention_scan = any(
+                (c := file_conventions.candidate(f)) is not None
+                and c[1] not in baseline_convs
+                for f in changed
+            )
             touches_release = any(is_release_file(f) for f in changed)
-            if not touches_gated and not needs_rollout_scan:
+            if not touches_gated and not needs_rollout_scan and not needs_convention_scan:
                 # Release bumps are commonly one-line changes to release.py
                 # with nothing else. Still parse so detected_version
                 # advances for subsequent commits.
@@ -392,6 +423,7 @@ def run_repo(
                 preloaded_files=changed, preloaded_info=info,
                 blob_fetcher=fetcher, repo_state=repo_state,
                 baseline_context_keys=baseline_keys,
+                baseline_conventions=baseline_convs,
             )
             if record:
                 write_record(config.workspace, record)
@@ -413,14 +445,18 @@ def run_repo(
     return summaries
 
 
-def _load_or_build_baseline_keys(
+def _load_or_build_baseline(
     repo: RepoConfig,
     config: Config,
     status_cb: StatusCb | None,
+    *,
+    name: str,
+    label: str,
+    build: Callable[[str], frozenset[str]],
 ) -> frozenset[str]:
-    """Resolve the baseline SHA from `since_date`, scan the tree there
-    for `@api.depends_context` keys, and cache the result by SHA. If
-    the cache hit matches the resolved SHA, skip the scan.
+    """Resolve the baseline SHA from `since_date`, build the named
+    baseline set there via `build(baseline_sha)`, and cache the result
+    by SHA. If the cache hit matches the resolved SHA, skip the scan.
 
     Returns an empty set when the config has no `since_date` or no
     commit predates it on the tracked branch (fresh repo, or the entire
@@ -439,7 +475,7 @@ def _load_or_build_baseline_keys(
     if not baseline_sha:
         return frozenset()
     cache_path = (
-        config.workspace / "baselines" / f"context_keys.{repo.name}.json"
+        config.workspace / "baselines" / f"{name}.{repo.name}.json"
     )
     if cache_path.exists():
         try:
@@ -450,16 +486,44 @@ def _load_or_build_baseline_keys(
             pass
     if status_cb:
         status_cb(
-            f"{repo.name}: scanning baseline context keys at "
+            f"{repo.name}: scanning baseline {label} at "
             f"{baseline_sha[:10]} (one-time, cached)..."
         )
-    keys = context_keys.scan_baseline_keys(repo.mirror, baseline_sha)
+    keys = build(baseline_sha)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(json.dumps(
         {"baseline_sha": baseline_sha, "keys": sorted(keys)},
         indent=2,
     ) + "\n")
     return frozenset(keys)
+
+
+def _load_or_build_baseline_keys(
+    repo: RepoConfig,
+    config: Config,
+    status_cb: StatusCb | None,
+) -> frozenset[str]:
+    return _load_or_build_baseline(
+        repo, config, status_cb,
+        name="context_keys", label="context keys",
+        build=lambda sha: frozenset(
+            context_keys.scan_baseline_keys(repo.mirror, sha)
+        ),
+    )
+
+
+def _load_or_build_baseline_conventions(
+    repo: RepoConfig,
+    config: Config,
+    status_cb: StatusCb | None,
+) -> frozenset[str]:
+    return _load_or_build_baseline(
+        repo, config, status_cb,
+        name="file_conventions", label="data-file basenames",
+        build=lambda sha: file_conventions.baseline_basenames(
+            gitio.ls_tree(repo.mirror, sha)
+        ),
+    )
 
 
 def _ordered_for_watchlist_build(repos: list[RepoConfig]) -> list[RepoConfig]:

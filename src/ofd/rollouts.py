@@ -129,6 +129,11 @@ _KIND_LANGUAGES: dict[Kind, frozenset[Language]] = {
     Kind.NEW_VIEW_ELEMENT:          frozenset({Language.VIEW}),
     Kind.NEW_VIEW_DIRECTIVE:        frozenset({Language.VIEW}),
     Kind.REMOVED_VIEW_ATTRIBUTE:    frozenset({Language.VIEW}),
+    # File conventions are path-shaped, not content-shaped: their
+    # adoptions are emitted by the file_conventions extractor itself
+    # (a module *adding* a file with the watchlisted basename), so
+    # content scanning never applies.
+    Kind.NEW_FILE_CONVENTION:       frozenset(),
 }
 
 # PY+VIEW kinds where a *generic* short name (in `_GENERIC_SHORT_NAMES`)
