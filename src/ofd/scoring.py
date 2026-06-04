@@ -19,6 +19,9 @@ from ofd.events.record import ChangeRecord, CommitEnvelope, Kind
 from ofd.globs import match_any
 
 _BASE: dict[Kind, int] = {
+    # Epoch events ("OWL 3 landed") should make the ledger on their own;
+    # 4 clears the ledger threshold without any modifier help.
+    Kind.VENDORED_LIB_BUMP: 4,
     Kind.NEW_PUBLIC_CLASS: 3,
     Kind.NEW_ENDPOINT: 3,
     Kind.NEW_VIEW_TYPE: 3,
@@ -28,9 +31,15 @@ _BASE: dict[Kind, int] = {
     Kind.REMOVED_PUBLIC_SYMBOL: 3,
     Kind.REMOVED_VIEW_ATTRIBUTE: 3,
     Kind.NEW_FILE_CONVENTION: 3,
+    # A new registry category is a new extension point; a removed export
+    # is a deprecation story.
+    Kind.NEW_REGISTRY_CATEGORY: 3,
+    Kind.REMOVED_JS_EXPORT: 3,
     Kind.NEW_DECORATOR_OR_HELPER: 2,
     Kind.NEW_KWARG: 2,
     Kind.NEW_VIEW_DIRECTIVE: 2,
+    Kind.NEW_JS_EXPORT: 2,
+    Kind.NEW_REGISTRY_ENTRY: 2,
     Kind.SIGNATURE_CHANGE: 1,
     Kind.NEW_CLASS_ATTRIBUTE: 1,
     Kind.ROLLOUT: 0,
@@ -51,6 +60,11 @@ _KIND_PRIORITY: dict[Kind, int] = {
     Kind.NEW_VIEW_DIRECTIVE: 11,
     Kind.SIGNATURE_CHANGE: 12,
     Kind.NEW_CLASS_ATTRIBUTE: 13,
+    Kind.VENDORED_LIB_BUMP: 14,
+    Kind.NEW_REGISTRY_CATEGORY: 15,
+    Kind.REMOVED_JS_EXPORT: 16,
+    Kind.NEW_JS_EXPORT: 17,
+    Kind.NEW_REGISTRY_ENTRY: 18,
     Kind.ROLLOUT: 99,
 }
 

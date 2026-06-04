@@ -98,13 +98,18 @@ Per commit on the tracked branch:
    the new `version_info` tuple and cache it on `RepoState`. All
    subsequent envelopes stamp `active_version` from the cache, so each
    primitive records the series it landed in (e.g. 19.2 vs 19.4).
-2. **Extract** framework-path files with the Python / RNG extractors.
-   Emits definition events (new class, new kwarg, signature change,
-   deprecation, etc.). Two wide-scope extractors also run outside
-   framework paths: context keys (new `@api.depends_context(...)`
-   args anywhere) and file conventions (a previously-unseen data-file
-   basename added under `security/`/`data/` across ≥3 modules in one
-   commit, e.g. `ir.access.csv`; later adopters emit rollouts).
+2. **Extract** framework-path files with the Python / RNG / JS
+   extractors. Emits definition events (new class, new kwarg, new JS
+   export, signature change, deprecation, etc.). Three wide-scope
+   extractors also run outside framework paths: context keys (new
+   `@api.depends_context(...)` args anywhere), file conventions (a
+   previously-unseen data-file basename added under `security/`/`data/`
+   across ≥3 modules in one commit, e.g. `ir.access.csv`; later
+   adopters emit rollouts), and the JS registry scan (new
+   `registry.category(...)` strings anywhere; `.add(...)` entries are
+   definitions in framework paths and category rollouts elsewhere).
+   A vendored-lib sniff also watches `web/static/lib/owl/owl.js` for
+   major-version bumps ("OWL 3 landed" as one epoch event).
 3. **Watchlist update.** Every new definition adds its short name to
    the watchlist so later commits can be scanned for adoption.
 4. **Rollout scan.** Every non-gated changed file's diff is scanned for
@@ -153,6 +158,18 @@ File-convention detector: `new_file_convention` (path-shaped, not
 content-shaped - its rollouts are emitted by the detector itself when
 a module *adds* a file with the watchlisted basename; the content
 matcher never scans for it).
+
+JS extractor: `new_js_export`, `removed_js_export` (export diff over
+framework `static/src` paths; exported hooks are stamped for ledger
+display; same-commit renames fold into one `signature_change`),
+`new_registry_category`, `new_registry_entry` (the
+`registry.category("x").add("y", ...)` typed-string registry; category
+adoptions are emitted by the extractor itself, like file conventions),
+and `vendored_lib_bump` (major-version change of a tracked vendored
+bundle, e.g. OWL). All JS kinds are definitions-only for now: the
+content matcher never scans for them (cross-language matching is the
+documented false-positive factory); import-anchored adoption matching
+is phase 2 of `DESIGN-js.md` and bench-gated.
 
 Rollout detector: `rollout` (one per hit per hunk; carries before/after
 snippets for slide content).
@@ -203,7 +220,7 @@ matcher doesn't care how a name got into the watchlist.
 .venv/bin/pytest
 ```
 
-156 tests cover the extractors, pipeline stages, rollout matcher,
+243 tests cover the extractors, pipeline stages, rollout matcher,
 release-version detection, ledger reader/writer, scoring, CLI
 resolver/`--since` parser, watchlist persistence, and end-to-end flows
 against a disposable git fixture.

@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import PurePosixPath
 
 from ofd.events.record import ChangeRecord
-from ofd.extractors import python_, rng
+from ofd.extractors import js_, python_, rng
 
 
 def extract_for_file(
@@ -21,5 +21,9 @@ def extract_for_file(
             return []
     if ext == ".rng":
         return rng.extract(parent_source, child_source, file)
-    # XML / JS handlers will plug in here.
+    if ext == ".js":
+        # Export diff only - the registry scan and vendored-lib sniff
+        # are wide-scope and run as their own pipeline stages.
+        return js_.extract(parent_source, child_source, file)
+    # XML handler will plug in here.
     return []

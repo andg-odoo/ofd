@@ -134,6 +134,18 @@ _KIND_LANGUAGES: dict[Kind, frozenset[Language]] = {
     # (a module *adding* a file with the watchlisted basename), so
     # content scanning never applies.
     Kind.NEW_FILE_CONVENTION:       frozenset(),
+    # JS primitives (DESIGN-js.md). Phase 1 is definitions-only: no
+    # content matching anywhere. Phase 2 (import-anchored matching,
+    # bench-gated with PropertiesDefinition.setup / Transaction.cache
+    # as must-not-match regressions) will introduce Language.JS for
+    # exactly these kinds. INVARIANT: never add Language.JS to any
+    # Python/View kind above - cross-language content matching is the
+    # documented false-positive factory. Registry-category adoptions
+    # are emitted by the js_ extractor itself, like file conventions.
+    Kind.NEW_JS_EXPORT:             frozenset(),
+    Kind.NEW_REGISTRY_CATEGORY:     frozenset(),
+    Kind.NEW_REGISTRY_ENTRY:        frozenset(),
+    Kind.VENDORED_LIB_BUMP:         frozenset(),
 }
 
 # PY+VIEW kinds where a *generic* short name (in `_GENERIC_SHORT_NAMES`)

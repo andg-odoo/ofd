@@ -94,8 +94,15 @@ The path->alias transform is `addons/<addon>/static/src/<rest>.js ->
   unchanged (no Python/View primitive ever matches in JS).
 - The JS matcher recognizes exactly two positions:
   1. `import { NAME } from "..."` / `import NAME from "..."` on an
-     added diff line. Bonus precision: when the entry's module alias
-     is known, require the from-string to match it.
+     added diff line. ~~Bonus precision: when the entry's module alias
+     is known, require the from-string to match it.~~ **Disproved by
+     Phase 1 data (2026-06-04):** `localeCompare` is defined in
+     `@web/core/l10n/utils/collation` but all 28 real odoo adopters
+     import it from the `@web/core/l10n/utils` barrel re-export. A
+     strict from-string match counts zero of them. The matcher must
+     anchor on the imported *name* with any from-string (or track
+     re-export barrels). Add the localeCompare barrel case to the
+     bench corpus as a must-match.
   2. `registry.category("CAT").add(` for category entries (extractor-
      emitted, see above; not the content matcher).
 - JS generic-short-name blocklist, mirroring `_GENERIC_SHORT_NAMES`:
@@ -157,11 +164,20 @@ What remains, and how the refactor still gets marked:
 
 ## Phasing & bench gates
 
-- **Phase 1 - definitions only.** Both anchors, no rollout matching
-  (`_KIND_LANGUAGES` rows stay empty). Ledger fills with JS
-  primitives at zero rollouts. Zero false-positive risk; immediately
-  useful for the talk. Gate: reindex diff eyeballed, unit + e2e tests
-  in the `test_file_conventions.py` style.
+- **Phase 1 - definitions only. DONE 2026-06-04.** Both anchors, no
+  rollout matching (`_KIND_LANGUAGES` rows stay empty). Ledger fills
+  with JS primitives at zero rollouts. Zero false-positive risk;
+  immediately useful for the talk. Gate: reindex diff eyeballed, unit
+  + e2e tests in the `test_file_conventions.py` style.
+  Reindex results: 102 NEW_JS_EXPORT, 47 REMOVED_JS_EXPORT, 19
+  NEW_REGISTRY_CATEGORY, 18 NEW_REGISTRY_ENTRY, exactly 1
+  VENDORED_LIB_BUMP (owl 2.8.2 -> 3.0.0-alpha.31), 51 extractor-emitted
+  registry rollouts (pos_payment_providers x18 the star). Two field
+  notes: (a) rename folding never fired on the real corpus - candidate
+  for deletion per the OWL section's own rule, decide in phase 2;
+  (b) NEW_REGISTRY_CATEGORY was implemented wide-scope (addon-invented
+  registries count) - that's what surfaced web_studio's
+  `editor_fields` from enterprise; tighten only if it gets noisy.
 - **Phase 2 - adoption.** Import-anchored matcher + registry rollouts
   + baselines. Gate: bench corpus must include the historical false
   positives (`PropertiesDefinition.setup`, `Transaction.cache`) as

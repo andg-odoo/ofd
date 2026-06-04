@@ -31,6 +31,12 @@ _NEW_API_KINDS = {
     Kind.NEW_ENDPOINT,
     Kind.NEW_VIEW_TYPE,
     Kind.NEW_FILE_CONVENTION,
+    # JS headline kinds. NEW_REGISTRY_ENTRY stays out, mirroring the
+    # NEW_KWARG precedent: fine-grained kinds narrate via their parent
+    # surface, not standalone.
+    Kind.NEW_JS_EXPORT,
+    Kind.NEW_REGISTRY_CATEGORY,
+    Kind.VENDORED_LIB_BUMP,
 }
 _DEPRECATION_KINDS = {Kind.DEPRECATION_WARNING_ADDED}
 

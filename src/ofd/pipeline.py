@@ -25,7 +25,7 @@ from ofd.config import Config, RepoConfig
 from ofd.events.record import ChangeRecord, CommitEnvelope, CommitRecord, Kind
 from ofd.events.store import raw_path
 from ofd.events.store import write as write_record
-from ofd.extractors import context_keys, file_conventions
+from ofd.extractors import context_keys, file_conventions, js_
 from ofd.extractors.dispatcher import extract_for_file
 from ofd.globs import match_any
 from ofd.release_detect import detect_version, is_release_file
@@ -142,6 +142,7 @@ def process_commit(
     repo_state=None,
     baseline_context_keys: frozenset[str] | None = None,
     baseline_conventions: frozenset[str] | None = None,
+    baseline_registry: frozenset[str] | None = None,
 ) -> CommitRecord | None:
     """Run extract + rollout + score for one commit. Returns a CommitRecord
     if any changes were found, else None. Does not persist - caller writes.
@@ -256,6 +257,45 @@ def process_commit(
             conv_added.append((file, module, basename))
     if conv_added:
         changes.extend(file_conventions.extract(conv_added, watchlist.entries))
+
+    # --- stage 1.7: wide-scope JS registry scan ---
+    # `registry.category("x").add("y", ...)` lives mostly in addons,
+    # outside framework paths - same shape as context keys, so the same
+    # needle-gated wide scan: only files whose patch mentions
+    # `registry.category` get fetched and parsed. New categories are
+    # definitions wherever they appear; new entries are definitions in
+    # framework paths and category rollouts elsewhere.
+    js_files = [f for f in all_files if f.endswith(".js")]
+    if js_files:
+        if all_patches is None:
+            all_patches = gitio.commit_diff_by_file(repo.mirror, sha)
+        registry_files: list[tuple[str, bool, str | None, str | None]] = []
+        for file in js_files:
+            if "registry.category" not in all_patches.get(file, ""):
+                continue
+            if file not in child_sources:
+                child_sources[file] = _fetch(sha, file)
+            registry_files.append((
+                file,
+                match_any(file, repo.framework_paths),
+                _fetch(f"{sha}^", file),
+                child_sources[file],
+            ))
+        if registry_files:
+            changes.extend(js_.extract_registry(
+                registry_files, watchlist.entries, baseline_registry,
+            ))
+
+    # --- stage 1.8: vendored-lib version sniff ---
+    # Epoch events ("OWL 3 landed") from major-version changes of
+    # tracked vendored bundles. Path-gated dict lookup, so the cost on
+    # ordinary commits is nil.
+    for file in all_files:
+        if js_.vendored_lib_alias(file) is None:
+            continue
+        changes.extend(js_.extract_lib_bump(
+            _fetch(f"{sha}^", file), _fetch(sha, file), file,
+        ))
 
     # Collapse same-commit override duplicates before they reach the
     # watchlist so they never become shadow entries in the first place.
@@ -375,6 +415,10 @@ def run_repo(
     # Same idea for data-file basenames under security/ and data/:
     # everything present at the floor is a known convention.
     baseline_convs = _load_or_build_baseline_conventions(repo, config, status_cb)
+    # And for JS registry categories/entries: everything registered at
+    # the floor is pre-known, so a new addon re-citing `services` or
+    # re-adding a floor-era entry never fires.
+    baseline_registry = _load_or_build_baseline_registry(repo, config, status_cb)
 
     # Bulk-enumerate commits + their file lists in a single git call -
     # orders of magnitude faster than per-commit diff-tree when most
@@ -401,8 +445,19 @@ def run_repo(
                 and c[1] not in baseline_convs
                 for f in changed
             )
+            # JS commits need the registry needle check (and vendored-lib
+            # sniff), which requires the diff - can't be decided from
+            # file names alone. With a non-empty watchlist these commits
+            # already pass `needs_rollout_scan`; this gate only matters
+            # for the empty-watchlist window at the start of a reindex.
+            touches_js = any(f.endswith(".js") for f in changed)
             touches_release = any(is_release_file(f) for f in changed)
-            if not touches_gated and not needs_rollout_scan and not needs_convention_scan:
+            if (
+                not touches_gated
+                and not needs_rollout_scan
+                and not needs_convention_scan
+                and not touches_js
+            ):
                 # Release bumps are commonly one-line changes to release.py
                 # with nothing else. Still parse so detected_version
                 # advances for subsequent commits.
@@ -424,6 +479,7 @@ def run_repo(
                 blob_fetcher=fetcher, repo_state=repo_state,
                 baseline_context_keys=baseline_keys,
                 baseline_conventions=baseline_convs,
+                baseline_registry=baseline_registry,
             )
             if record:
                 write_record(config.workspace, record)
@@ -522,6 +578,20 @@ def _load_or_build_baseline_conventions(
         name="file_conventions", label="data-file basenames",
         build=lambda sha: file_conventions.baseline_basenames(
             gitio.ls_tree(repo.mirror, sha)
+        ),
+    )
+
+
+def _load_or_build_baseline_registry(
+    repo: RepoConfig,
+    config: Config,
+    status_cb: StatusCb | None,
+) -> frozenset[str]:
+    return _load_or_build_baseline(
+        repo, config, status_cb,
+        name="js_registry", label="JS registry symbols",
+        build=lambda sha: frozenset(
+            js_.scan_baseline_registry(repo.mirror, sha)
         ),
     )
 
