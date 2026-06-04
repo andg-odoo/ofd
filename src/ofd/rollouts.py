@@ -140,8 +140,12 @@ _KIND_LANGUAGES: dict[Kind, frozenset[Language]] = {
     # File conventions are path-shaped, not content-shaped: their
     # adoptions are emitted by the file_conventions extractor itself
     # (a module *adding* a file with the watchlisted basename), so
-    # content scanning never applies.
+    # content scanning never applies. Manifest keys are the same
+    # (extractor-emitted on later manifests adding the key), and a
+    # dependency change has no adoption surface at all.
     Kind.NEW_FILE_CONVENTION:       frozenset(),
+    Kind.NEW_MANIFEST_KEY:          frozenset(),
+    Kind.DEPENDENCY_CHANGE:         frozenset(),
     # JS primitives (DESIGN-js.md, phases 2+3). Exports adopt via
     # import lines in .js (`_js_import_pattern`) and via component
     # tags (`<BadgeTag`) in OWL templates - QWEB scope, phase 3.

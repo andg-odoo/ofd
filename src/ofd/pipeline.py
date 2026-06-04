@@ -14,6 +14,7 @@ Per-repo sequential commit processing:
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -25,7 +26,13 @@ from ofd.config import Config, RepoConfig
 from ofd.events.record import ChangeRecord, CommitEnvelope, CommitRecord, Kind
 from ofd.events.store import raw_path
 from ofd.events.store import write as write_record
-from ofd.extractors import context_keys, file_conventions, js_
+from ofd.extractors import (
+    context_keys,
+    dependencies,
+    file_conventions,
+    js_,
+    manifest_keys,
+)
 from ofd.extractors.dispatcher import extract_for_file
 from ofd.globs import match_any
 from ofd.release_detect import detect_version, is_release_file
@@ -37,6 +44,16 @@ from ofd.watchlist import Watchlist
 
 def _is_gated(path: str, patterns: list[str]) -> bool:
     return match_any(path, patterns)
+
+
+# Added line that *looks like* it carries a manifest dict key. Pre-gate
+# before the parent/child fetch + ast parse: data-list / depends edits
+# add no key-shaped line at all. Over-matching (version bumps, nested
+# asset-bucket keys, one-line dicts) is fine - the exact ast top-level
+# diff decides.
+_MANIFEST_KEY_LINE = re.compile(
+    r"""^\+.*['"][A-Za-z_][\w.]*['"]\s*:""", re.MULTILINE,
+)
 
 
 def _dedupe_kwarg_overrides(records: list[ChangeRecord]) -> list[ChangeRecord]:
@@ -143,6 +160,7 @@ def process_commit(
     baseline_context_keys: frozenset[str] | None = None,
     baseline_conventions: frozenset[str] | None = None,
     baseline_registry: frozenset[str] | None = None,
+    baseline_manifest_keys: frozenset[str] | None = None,
 ) -> CommitRecord | None:
     """Run extract + rollout + score for one commit. Returns a CommitRecord
     if any changes were found, else None. Does not persist - caller writes.
@@ -258,6 +276,31 @@ def process_commit(
     if conv_added:
         changes.extend(file_conventions.extract(conv_added, watchlist.entries))
 
+    # --- stage 1.65: manifest-key detection ---
+    # Wide-scope like context keys. Manifests churn constantly (version
+    # bumps, depends edits), so gate on an added key-shaped line in the
+    # patch before paying the parent/child fetch + parse; the exact
+    # ast diff then keeps only genuinely new top-level keys.
+    manifest_files = [
+        f for f in all_files
+        if f.endswith("__manifest__.py")
+        and not manifest_keys.is_test_module_manifest(f)
+    ]
+    if manifest_files:
+        if all_patches is None:
+            all_patches = gitio.commit_diff_by_file(repo.mirror, sha)
+        gated_manifests: list[tuple[str, str | None, str | None]] = []
+        for file in manifest_files:
+            if not _MANIFEST_KEY_LINE.search(all_patches.get(file, "")):
+                continue
+            gated_manifests.append((
+                file, _fetch(f"{sha}^", file), _fetch(sha, file),
+            ))
+        if gated_manifests:
+            changes.extend(manifest_keys.extract(
+                gated_manifests, watchlist.entries, baseline_manifest_keys,
+            ))
+
     # --- stage 1.7: wide-scope JS registry scan ---
     # `registry.category("x").add("y", ...)` lives mostly in addons,
     # outside framework paths - same shape as context keys, so the same
@@ -295,6 +338,17 @@ def process_commit(
             continue
         changes.extend(js_.extract_lib_bump(
             _fetch(f"{sha}^", file), _fetch(sha, file), file,
+        ))
+
+    # --- stage 1.85: external-dependency epochs ---
+    # Added/removed package names in the repo-root requirements.txt.
+    # Strict path equality: addon-local requirements files aren't
+    # platform dependencies.
+    if "requirements.txt" in all_files:
+        changes.extend(dependencies.extract(
+            _fetch(f"{sha}^", "requirements.txt"),
+            _fetch(sha, "requirements.txt"),
+            "requirements.txt",
         ))
 
     # Collapse same-commit override duplicates before they reach the
@@ -427,6 +481,11 @@ def run_repo(
     # the floor is pre-known, so a new addon re-citing `services` or
     # re-adding a floor-era entry never fires.
     baseline_registry = _load_or_build_baseline_registry(repo, config, status_cb)
+    # And for manifest keys: every top-level key used by any manifest
+    # at the floor is pre-known.
+    baseline_manifests = _load_or_build_baseline_manifest_keys(
+        repo, config, status_cb,
+    )
 
     # Bulk-enumerate commits + their file lists in a single git call -
     # orders of magnitude faster than per-commit diff-tree when most
@@ -459,12 +518,21 @@ def run_repo(
             # already pass `needs_rollout_scan`; this gate only matters
             # for the empty-watchlist window at the start of a reindex.
             touches_js = any(f.endswith(".js") for f in changed)
+            # Manifest / requirements commits need their own gate for
+            # the empty-watchlist window, like touches_js: manifests
+            # are .py (so usually covered by needs_rollout_scan) but
+            # requirements.txt is invisible to the extension check.
+            touches_platform_meta = any(
+                f.endswith("__manifest__.py") or f == "requirements.txt"
+                for f in changed
+            )
             touches_release = any(is_release_file(f) for f in changed)
             if (
                 not touches_gated
                 and not needs_rollout_scan
                 and not needs_convention_scan
                 and not touches_js
+                and not touches_platform_meta
             ):
                 # Release bumps are commonly one-line changes to release.py
                 # with nothing else. Still parse so detected_version
@@ -488,6 +556,7 @@ def run_repo(
                 baseline_context_keys=baseline_keys,
                 baseline_conventions=baseline_convs,
                 baseline_registry=baseline_registry,
+                baseline_manifest_keys=baseline_manifests,
             )
             if record:
                 write_record(config.workspace, record)
@@ -600,6 +669,20 @@ def _load_or_build_baseline_registry(
         name="js_registry", label="JS registry symbols",
         build=lambda sha: frozenset(
             js_.scan_baseline_registry(repo.mirror, sha)
+        ),
+    )
+
+
+def _load_or_build_baseline_manifest_keys(
+    repo: RepoConfig,
+    config: Config,
+    status_cb: StatusCb | None,
+) -> frozenset[str]:
+    return _load_or_build_baseline(
+        repo, config, status_cb,
+        name="manifest_keys", label="manifest keys",
+        build=lambda sha: frozenset(
+            manifest_keys.scan_baseline_keys(repo.mirror, sha)
         ),
     )
 

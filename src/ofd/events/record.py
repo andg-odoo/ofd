@@ -27,6 +27,8 @@ class Kind(StrEnum):
     REMOVED_VIEW_ATTRIBUTE = "removed_view_attribute"
     NEW_CONTEXT_KEY = "new_context_key"
     NEW_FILE_CONVENTION = "new_file_convention"
+    NEW_MANIFEST_KEY = "new_manifest_key"
+    DEPENDENCY_CHANGE = "dependency_change"
     NEW_JS_EXPORT = "new_js_export"
     REMOVED_JS_EXPORT = "removed_js_export"
     NEW_REGISTRY_CATEGORY = "new_registry_category"
@@ -46,6 +48,8 @@ DEFINITION_KINDS = frozenset({
     Kind.NEW_VIEW_DIRECTIVE,
     Kind.NEW_CONTEXT_KEY,
     Kind.NEW_FILE_CONVENTION,
+    Kind.NEW_MANIFEST_KEY,
+    Kind.DEPENDENCY_CHANGE,
     Kind.NEW_JS_EXPORT,
     Kind.NEW_REGISTRY_CATEGORY,
     Kind.NEW_REGISTRY_ENTRY,

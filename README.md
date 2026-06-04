@@ -105,11 +105,14 @@ Per commit on the tracked branch:
    `@api.depends_context(...)` args anywhere), file conventions (a
    previously-unseen data-file basename added under `security/`/`data/`
    across ≥3 modules in one commit, e.g. `ir.access.csv`; later
-   adopters emit rollouts), and the JS registry scan (new
+   adopters emit rollouts), the JS registry scan (new
    `registry.category(...)` strings anywhere; `.add(...)` entries are
-   definitions in framework paths and category rollouts elsewhere).
-   A vendored-lib sniff also watches `web/static/lib/owl/owl.js` for
-   major-version bumps ("OWL 3 landed" as one epoch event).
+   definitions in framework paths and category rollouts elsewhere),
+   and manifest keys (a top-level `__manifest__.py` key unseen at the
+   floor; later manifests adopting it emit rollouts). A vendored-lib
+   sniff watches `web/static/lib/owl/owl.js` for major-version bumps
+   ("OWL 3 landed" as one epoch event), and the repo-root
+   `requirements.txt` is diffed for added/removed package names.
 3. **Watchlist update.** Every new definition adds its short name to
    the watchlist so later commits can be scanned for adoption - except
    definitions under a repo's `surface_only_paths` (migration tooling
@@ -165,6 +168,13 @@ File-convention detector: `new_file_convention` (path-shaped, not
 content-shaped - its rollouts are emitted by the detector itself when
 a module *adds* a file with the watchlisted basename; the content
 matcher never scans for it).
+
+Platform-metadata detectors: `new_manifest_key` (a top-level
+`__manifest__.py` key unseen at the floor; later manifests adding it
+are extractor-emitted rollouts; `test_*` addon manifests are skipped)
+and `dependency_change` (package added to / removed from the repo-root
+`requirements.txt`; version-pin and python-marker churn stays silent;
+base 4, an epoch event like the vendored-lib bump).
 
 JS extractor: `new_js_export`, `removed_js_export` (export diff over
 framework `static/src` paths; exported hooks are stamped for ledger

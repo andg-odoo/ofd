@@ -19,9 +19,11 @@ from ofd.events.record import ChangeRecord, CommitEnvelope, Kind
 from ofd.globs import match_any
 
 _BASE: dict[Kind, int] = {
-    # Epoch events ("OWL 3 landed") should make the ledger on their own;
-    # 4 clears the ledger threshold without any modifier help.
+    # Epoch events ("OWL 3 landed", "weasyprint added to requirements")
+    # should make the ledger on their own; 4 clears the ledger threshold
+    # without any modifier help.
     Kind.VENDORED_LIB_BUMP: 4,
+    Kind.DEPENDENCY_CHANGE: 4,
     Kind.NEW_PUBLIC_CLASS: 3,
     Kind.NEW_ENDPOINT: 3,
     Kind.NEW_VIEW_TYPE: 3,
@@ -32,8 +34,10 @@ _BASE: dict[Kind, int] = {
     Kind.REMOVED_VIEW_ATTRIBUTE: 3,
     Kind.NEW_FILE_CONVENTION: 3,
     # A new registry category is a new extension point; a removed export
-    # is a deprecation story.
+    # is a deprecation story. A new manifest key is a new module-level
+    # platform knob.
     Kind.NEW_REGISTRY_CATEGORY: 3,
+    Kind.NEW_MANIFEST_KEY: 3,
     Kind.REMOVED_JS_EXPORT: 3,
     Kind.NEW_DECORATOR_OR_HELPER: 2,
     Kind.NEW_KWARG: 2,
@@ -65,6 +69,8 @@ _KIND_PRIORITY: dict[Kind, int] = {
     Kind.REMOVED_JS_EXPORT: 16,
     Kind.NEW_JS_EXPORT: 17,
     Kind.NEW_REGISTRY_ENTRY: 18,
+    Kind.DEPENDENCY_CHANGE: 19,
+    Kind.NEW_MANIFEST_KEY: 20,
     Kind.ROLLOUT: 99,
 }
 
