@@ -22,6 +22,19 @@ _ELEMENT_SCOPED_KINDS = frozenset({
     Kind.NEW_VIEW_DIRECTIVE,
 })
 
+# Kinds where a definition sharing (kind, parent segment, short name)
+# with an existing entry is an *override* of the same primitive, not a
+# new one. When base introduced the typed config-param API, mail's
+# `_inherit` override of `set_str` became a second watchlist entry -
+# and since `addons.mail...` sorts before `odoo.addons.base...`, the
+# shared-short-name matcher attributed all 189 set_str adoptions to
+# the override. Fold overrides onto the first-seen entry instead.
+_OVERRIDE_FOLD_KINDS = frozenset({
+    Kind.NEW_DECORATOR_OR_HELPER,
+    Kind.NEW_CLASS_ATTRIBUTE,
+    Kind.NEW_PUBLIC_CLASS,
+})
+
 
 @dataclass
 class WatchlistEntry:
@@ -73,6 +86,22 @@ class Watchlist:
             return None
         if record.symbol in self.entries:
             return self.entries[record.symbol]
+        # Override folding: `addons.mail...IrConfig_Parameter.set_str`
+        # is the same primitive as the already-tracked
+        # `odoo.addons.base...IrConfig_Parameter.set_str` (an
+        # `_inherit` override), not a new API. The (kind, class/file
+        # segment, short name) tail identifies it.
+        if record.kind in _OVERRIDE_FOLD_KINDS:
+            parts = record.symbol.split(".")
+            if len(parts) >= 2:
+                tail = (record.kind, parts[-2], parts[-1])
+                for existing in self.entries.values():
+                    ep = existing.symbol.split(".")
+                    if (
+                        len(ep) >= 2
+                        and (existing.kind, ep[-2], ep[-1]) == tail
+                    ):
+                        return existing
         short = record.symbol.rsplit(".", 1)[-1]
         # Directive symbols look like `<file>.<parent>+<child>` so the
         # naive last-segment short name comes out as `parent+child` -

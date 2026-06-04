@@ -1135,3 +1135,43 @@ def test_js_from_string_must_be_plausible():
     assert len(detect_rollouts(_js_patch(
         'import { formatDuration } from "./formatters";'
     ), wl, {})) == 1
+
+
+def test_override_folds_onto_existing_entry():
+    """An `_inherit` override of an already-tracked method (same kind,
+    class segment, short name) is the same primitive: mail's set_str
+    override must not become a second entry that steals base's
+    adoptions via alphabetical first-wins."""
+    wl = Watchlist()
+    base = wl.add_from_definition(
+        ChangeRecord(
+            kind=Kind.NEW_DECORATOR_OR_HELPER,
+            file="odoo/addons/base/models/ir_config_parameter.py", line=1,
+            symbol="odoo.addons.base.models.ir_config_parameter.IrConfig_Parameter.set_str",
+        ),
+        repo="odoo", sha="a", committed_at="2026-04-01T00:00:00Z",
+        active_version="20.0",
+    )
+    override = wl.add_from_definition(
+        ChangeRecord(
+            kind=Kind.NEW_DECORATOR_OR_HELPER,
+            file="addons/mail/models/ir_config_parameter.py", line=1,
+            symbol="addons.mail.models.ir_config_parameter.IrConfig_Parameter.set_str",
+        ),
+        repo="odoo", sha="b", committed_at="2026-04-02T00:00:00Z",
+        active_version="20.0",
+    )
+    assert override is base
+    assert len(wl.entries) == 1
+    # A same-named method on a *different* class is a distinct primitive.
+    other = wl.add_from_definition(
+        ChangeRecord(
+            kind=Kind.NEW_DECORATOR_OR_HELPER,
+            file="odoo/tools/config.py", line=1,
+            symbol="odoo.tools.config.configmanager.set_str",
+        ),
+        repo="odoo", sha="c", committed_at="2026-04-03T00:00:00Z",
+        active_version="20.0",
+    )
+    assert other is not base
+    assert len(wl.entries) == 2
