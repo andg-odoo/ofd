@@ -302,7 +302,15 @@ def process_commit(
     changes = _dedupe_kwarg_overrides(changes)
 
     # --- stage 2: watchlist update (before rollout scan) ---
+    # Surface-only paths (migration tooling, CLI scripts) emit events
+    # but never join the watchlist: their helpers (`change`, `upgrade`,
+    # `tokenize`, ...) aren't adoptable APIs, yet their short names
+    # match everywhere once watchlisted.
     for record in changes:
+        if repo.surface_only_paths and match_any(
+            record.file, repo.surface_only_paths,
+        ):
+            continue
         watchlist.add_from_definition(
             record,
             repo=repo.name,

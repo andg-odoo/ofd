@@ -17,6 +17,13 @@ class RepoConfig:
     branch: str
     framework_paths: list[str]
     core_paths: list[str] = field(default_factory=list)
+    # Framework paths whose definitions are surfaced as events but
+    # never join the rollout watchlist. Migration tooling
+    # (`odoo/upgrade_code/**`) and CLI scripts define helpers named
+    # `change`, `upgrade`, `tokenize`, ... - nothing ever "adopts"
+    # them, but their short names match everywhere (the `change`
+    # column alone was 151 bogus rollouts).
+    surface_only_paths: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -102,6 +109,7 @@ def load(workspace: Path) -> Config:
             branch=cfg.get("branch", "master"),
             framework_paths=cfg.get("framework_paths", []),
             core_paths=cfg.get("core_paths", []),
+            surface_only_paths=cfg.get("surface_only_paths", []),
         )
         for name, cfg in (data.get("repos") or {}).items()
     ]
