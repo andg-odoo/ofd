@@ -44,17 +44,26 @@ from ofd.rollouts import (  # noqa: E402
     detect_rollouts,
 )
 
+# Kinds allowed to roll out on the JS/QWeb surface: JS exports (import
+# lines + component tags) and QWEB-capable attr needles. Anything else
+# firing in a .js / static/src .xml file is a cross-language regression.
 JS_KINDS = frozenset(
-    k for k, langs in _KIND_LANGUAGES.items() if Language.JS in langs
+    k for k, langs in _KIND_LANGUAGES.items()
+    if Language.JS in langs or Language.QWEB in langs
 )
 
 
-def _matched_import_lines(patch: str, short: str) -> list[str]:
-    """The added lines the import pattern anchored on, for the label file."""
+def _matched_import_lines(patch: str, short: str, is_xml: bool) -> list[str]:
+    """The added lines the matcher anchored on, for the label file."""
     added = "\n".join(
         line[1:] for line in patch.splitlines()
         if line.startswith("+") and not line.startswith("+++")
     )
+    if is_xml:
+        # Component tag or attr needle - show the whole line, capped.
+        n = re.escape(short)
+        pat = re.compile(rf"^.*(?:<{n}\b|\b{n}\s*=).*$", re.MULTILINE)
+        return sorted({m.group(0).strip()[:160] for m in pat.finditer(added)})
     pat = _js_import_pattern(short)
     return sorted({m.group(0).strip() for m in pat.finditer(added)})
 
@@ -95,7 +104,12 @@ def main() -> None:
         for info, files in commits:
             js_files = [
                 f for f in files
-                if f.endswith(".js")
+                if (
+                    f.endswith(".js")
+                    # QWeb templates (phase 3): component-tag and attr
+                    # needle adoption in OWL templates.
+                    or (f.endswith(".xml") and "/static/src/" in f)
+                )
                 and not match_any(f, repo.framework_paths)
             ]
             if not js_files:
@@ -117,6 +131,7 @@ def main() -> None:
                     "import_lines": _matched_import_lines(
                         patches[r.file],
                         entry.short_name if entry else r.symbol.rsplit(".", 1)[-1],
+                        r.file.endswith(".xml"),
                     ),
                 }
                 if entry is None or entry.kind not in JS_KINDS:

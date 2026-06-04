@@ -96,6 +96,7 @@ class Language(StrEnum):
     PY = "py"      # Python source (.py)
     VIEW = "view"  # XML / RNG view source (.xml, .rng)
     JS = "js"      # JavaScript source (.js)
+    QWEB = "qweb"  # OWL component templates (static/src/**/*.xml)
 
 
 # Languages each primitive kind can legitimately adopt in. A diff file's
@@ -127,7 +128,12 @@ _KIND_LANGUAGES: dict[Kind, frozenset[Language]] = {
     Kind.NEW_DECORATOR_OR_HELPER:   frozenset({Language.PY, Language.VIEW}),
     Kind.NEW_CLASS_ATTRIBUTE:       frozenset({Language.PY, Language.VIEW}),
     Kind.NEW_VIEW_TYPE:             frozenset({Language.PY, Language.VIEW}),
-    Kind.NEW_VIEW_ATTRIBUTE:        frozenset({Language.VIEW}),
+    # NEW_VIEW_ATTRIBUTE also matches in QWEB so manual attr-needle
+    # pins (`data-available-offline`) can track template adoption;
+    # extracted RNG entries are element-scoped (`<widget ... attr=`)
+    # and their host elements don't occur in OWL templates, so the
+    # extra scope is inert for them.
+    Kind.NEW_VIEW_ATTRIBUTE:        frozenset({Language.VIEW, Language.QWEB}),
     Kind.NEW_VIEW_ELEMENT:          frozenset({Language.VIEW}),
     Kind.NEW_VIEW_DIRECTIVE:        frozenset({Language.VIEW}),
     Kind.REMOVED_VIEW_ATTRIBUTE:    frozenset({Language.VIEW}),
@@ -136,14 +142,15 @@ _KIND_LANGUAGES: dict[Kind, frozenset[Language]] = {
     # (a module *adding* a file with the watchlisted basename), so
     # content scanning never applies.
     Kind.NEW_FILE_CONVENTION:       frozenset(),
-    # JS primitives (DESIGN-js.md, phase 2). Exports adopt via import
-    # lines only (`_js_import_pattern`) - JS-only by construction.
+    # JS primitives (DESIGN-js.md, phases 2+3). Exports adopt via
+    # import lines in .js (`_js_import_pattern`) and via component
+    # tags (`<BadgeTag`) in OWL templates - QWEB scope, phase 3.
     # INVARIANT: never add Language.JS to any Python/View kind above -
     # cross-language content matching is the documented false-positive
     # factory (PropertiesDefinition.setup / Transaction.cache).
     # REMOVED_JS_EXPORT isn't a definition kind so its row is inert;
     # it carries JS for symmetry with REMOVED_PUBLIC_SYMBOL.
-    Kind.NEW_JS_EXPORT:             frozenset({Language.JS}),
+    Kind.NEW_JS_EXPORT:             frozenset({Language.JS, Language.QWEB}),
     Kind.REMOVED_JS_EXPORT:         frozenset({Language.JS}),
     # Registry adoptions are emitted by the js_ extractor itself, like
     # file conventions - a category/entry short name ("tooltips") has
@@ -190,6 +197,14 @@ _GENERIC_SHORT_NAMES: frozenset[str] = frozenset({
     "default", "name", "value", "type", "data", "info", "state",
     "cache", "flush", "reset", "init", "close", "open", "read",
     "write", "save", "load", "delete", "create", "find", "match",
+    "change", "duplicate", "attributes",
+    # Odoo ORM / web vocabulary - ubiquitous on every model or request,
+    # so a new helper sharing the name matches every `.unlink()` /
+    # `request.env` in the tree. Proven columns (2026-06-04 corpus):
+    # ResCountry.unlink 661 bogus rollouts, Dispatcher.request 359,
+    # Manifest.raw_value 149 (kanban `record.x.raw_value` template
+    # expressions), FormatVatLabelMixin.fields_get 45.
+    "unlink", "request", "raw_value", "fields_get",
     # Ubiquitous parameter names - NEW_KWARG sub-symbols like
     # `SomeMethod.ids` would else match every `.ids` / `ids=` in Odoo.
     "ids", "id", "query", "table", "kind", "it", "model", "record",
@@ -548,65 +563,95 @@ def _specific_rule(name: str) -> dict:
 
 
 @lru_cache(maxsize=2048)
-def _kwarg_in_method_rule(kwarg: str, method: str) -> dict:
+def _kwarg_in_method_rule(kwarg: str, method: str | None) -> dict:
     """ast-grep rule: a `keyword_argument` named `kwarg` whose enclosing
     call's function is exactly `method` (bare `method(...)` or
-    `obj.method(...)`).
+    `obj.method(...)`), or the multi-line call fragment shape.
 
-    Used to disambiguate NEW_KWARG entries that share a short name
-    across different methods - e.g. `Field.to_sql.table` and
-    `Field.condition_to_sql.table` both pre-filter on `table` via
-    Aho-Corasick, but only one is the right attribution for any given
-    call site. Without this, the matcher's per-hunk dedupe sends every
-    `table=` adoption to whichever entry sorts first alphabetically
-    (`condition_to_sql` < `to_sql`), so `to_sql(table=...)` adoptions
-    show as zero-rollout shadows.
+    Two jobs:
+      - disambiguate NEW_KWARG entries that share a short name across
+        different methods (`Field.to_sql.table` vs
+        `Field.condition_to_sql.table`) so adoptions attribute to the
+        method actually called;
+      - validate single-entry kwargs against their call site at all.
+        The bare identifier/string qualifier let `('model', '=', ...)`
+        domain tuples count as `Query.__init__.model` adoptions and
+        `'binary'` type strings as `AssetsBundle.__init__.binary`.
+
+    `method=None` means "any constructor-shaped call" (capitalized
+    callee): an `__init__` kwarg is adopted via every subclass
+    constructor (`fields.Boolean(compute_sql=...)` adopts
+    `Field.__init__.compute_sql`), so an exact class-name match would
+    miss nearly all of them.
     """
     kwarg_re = f"^{re.escape(kwarg)}$"
-    method_re = f"^{re.escape(method)}$"
-    return {"rule": {
-        "kind": "keyword_argument",
-        "all": [
-            {"has": {"field": "name", "regex": kwarg_re, "stopBy": "end"}},
-            {"inside": {
-                "kind": "call",
-                "has": {"field": "function",
-                        "any": [
-                            {"kind": "identifier", "regex": method_re},
-                            {"kind": "attribute",
-                             "has": {"field": "attribute", "regex": method_re,
-                                     "stopBy": "end"}},
-                        ],
-                        "stopBy": "end"},
-                "stopBy": "end",
-            }},
-        ],
-    }}
+    method_re = "^[A-Z]" if method is None else f"^{re.escape(method)}$"
+    return {"rule": {"any": [
+        {"kind": "keyword_argument",
+         "all": [
+             {"has": {"field": "name", "regex": kwarg_re, "stopBy": "end"}},
+             {"inside": {
+                 "kind": "call",
+                 "has": {"field": "function",
+                         "any": [
+                             {"kind": "identifier", "regex": method_re},
+                             {"kind": "attribute",
+                              "has": {"field": "attribute", "regex": method_re,
+                                      "stopBy": "end"}},
+                         ],
+                         "stopBy": "end"},
+                 "stopBy": "end",
+             }},
+         ]},
+        # Multi-line call fragment: a hunk adding only `kwarg=value,`
+        # inside an existing call has no call node to validate against;
+        # the trailing comma makes it parse as an assignment to an
+        # expression_list - a shape random local-var assignments and
+        # quoted strings never take (same fingerprint as
+        # _strict_generic_rule's).
+        {"all": [
+            {"kind": "assignment"},
+            {"has": {"field": "left", "kind": "identifier",
+                     "regex": kwarg_re, "stopBy": "end"}},
+            {"has": {"field": "right", "kind": "expression_list",
+                     "stopBy": "end"}},
+        ]},
+    ]}}
 
 
-def _kwarg_method_targets(group: list[WatchlistEntry]) -> list[str] | None:
-    """Method names from a group of NEW_KWARG entries that share a
-    short name, or None if the group can't be method-discriminated.
+def _kwarg_method_targets(
+    group: list[WatchlistEntry],
+) -> list[str | None] | None:
+    """Call-site targets for a group of NEW_KWARG entries sharing a
+    short name, or None if the group can't be method-validated.
+
+    A `__init__` kwarg's call-site target is None ("any
+    constructor-shaped call"): adopters call subclass constructors
+    (`fields.Boolean(compute_sql=...)`), never `__init__` by name.
+
+    Single-entry groups are validated too: without the call-site check,
+    a specific-named kwarg only needs the bare identifier/string
+    qualifier, which let `('model', '=', ...)` domain tuples count as
+    `Query.__init__.model` adoptions (119 bogus rollouts) and `'binary'`
+    type strings as `AssetsBundle.__init__.binary` (127).
 
     Returns None when:
-      - the group has zero or one entry (single method, no choice to
-        make, cheaper to use the legacy path)
       - any entry isn't a NEW_KWARG (mixed groups fall back to legacy)
       - any symbol doesn't have the `<...>.<class>.<method>.<kwarg>`
         shape (need at least 4 segments to extract a method name)
-      - all entries have the same method (no discrimination needed)
+      - several entries share one target (no discrimination possible;
+        legacy first-wins dedupe keeps shared-name counts honest)
     """
-    if len(group) < 2:
-        return None
-    methods: list[str] = []
+    methods: list[str | None] = []
     for e in group:
         if e.kind is not Kind.NEW_KWARG or not e.symbol:
             return None
         parts = e.symbol.split(".")
         if len(parts) < 4:
             return None
-        methods.append(parts[-2])
-    if len(set(methods)) < 2:
+        method = parts[-2]
+        methods.append(None if method == "__init__" else method)
+    if len(group) > 1 and len(set(methods)) < 2:
         return None
     return methods
 
@@ -944,12 +989,21 @@ def _file_language(path: str) -> Language | None:
     systematically attribute hoot imports to same-named framework
     exports (bench 2026-06-04: 11 of 13 `macro.waitUntil` hits were
     hoot's). A test-file import isn't an adoption story even when
-    genuine, so the whole surface goes.
+    genuine, so the whole surface goes - templates under static/tests
+    included.
+
+    XML under `static/src/` is QWEB, not VIEW: OWL component templates
+    are a different namespace from backend view schemas, and every
+    VIEW-kind rollout ever recorded there was a cross-namespace FP
+    (194 on the 2026-06-04 corpus - `record.x.raw_value` expressions
+    matching `Manifest.raw_value`, t-attrs matching helper names).
+    QWEB's adoption surface is component tags (`<BadgeTag`) for JS
+    exports plus manual attr needles (`data-available-offline`).
     """
-    if path.endswith(".js") and (
-        "/static/tests/" in path or path.endswith(".test.js")
-    ):
+    if "/static/tests/" in path or path.endswith(".test.js"):
         return None
+    if path.endswith(".xml") and "/static/src/" in path:
+        return Language.QWEB
     for exts, lang in _FILE_LANGUAGES:
         if path.endswith(exts):
             return lang
@@ -964,16 +1018,23 @@ def _build_matcher(watchlist: Watchlist) -> _Matcher:
     # `_file_language`).
     compiled_by_scope: dict[str, dict[str, re.Pattern[str]]] = {
         Language.PY: {}, Language.VIEW: {}, Language.JS: {},
+        Language.QWEB: {},
     }
     for entry in watchlist.entries.values():
-        # JS kinds adopt in JS scope only (import lines); they never
+        kind_langs = _KIND_LANGUAGES.get(entry.kind, frozenset())
+        # JS kinds adopt via import lines in JS scope and (for
+        # components) via `<Name` tags in OWL templates; they never
         # need a PY/VIEW pattern, and no Python/View kind ever gets a
         # JS one - the language gate in detect_rollouts drops them
         # before pattern lookup.
-        if Language.JS in _KIND_LANGUAGES.get(entry.kind, frozenset()):
+        if Language.JS in kind_langs:
             compiled_by_scope[Language.JS][entry.symbol] = _js_import_pattern(
                 entry.short_name,
             )
+            if Language.QWEB in kind_langs:
+                compiled_by_scope[Language.QWEB][entry.symbol] = (
+                    _directive_pattern(entry.short_name)
+                )
             continue
         # Context keys get a dedicated tight pattern (rejects the bare
         # `.attribute` form on shared-name model fields). They're PY-only
@@ -1009,6 +1070,13 @@ def _build_matcher(watchlist: Watchlist) -> _Matcher:
         compiled_by_scope[Language.VIEW][entry.symbol] = _contextual_pattern(
             entry.short_name, module, entry.element, "xml",
         )
+        # QWEB-capable non-JS kinds (manual attr-needle pins) reuse the
+        # xml-shaped pattern - `data-available-offline=` matches via
+        # the attribute alternative, `t-att-` prefixed included.
+        if Language.QWEB in kind_langs:
+            compiled_by_scope[Language.QWEB][entry.symbol] = (
+                compiled_by_scope[Language.VIEW][entry.symbol]
+            )
     automaton = ahocorasick.Automaton()
     for short in by_short:
         automaton.add_word(short, short)
@@ -1135,6 +1203,7 @@ def detect_rollouts(
         is_py = file_lang is Language.PY
         is_view = file_lang is Language.VIEW
         is_js = file_lang is Language.JS
+        is_qweb = file_lang is Language.QWEB
         for hunk in _parse_patch(patch):
             added_blob = _strip_comments("\n".join(hunk.raw_added))
             if not added_blob.strip():
@@ -1184,7 +1253,7 @@ def detect_rollouts(
                         and e.short_name in _GENERIC_SHORT_NAMES
                     )
                     and not (
-                        is_js
+                        (is_js or is_qweb)
                         and e.short_name in _JS_GENERIC_SHORT_NAMES
                     )
                 ]

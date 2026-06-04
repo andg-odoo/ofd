@@ -199,10 +199,35 @@ What remains, and how the refactor still gets marked:
   an existing multi-line import list (diff shows a bare `NAME,` line -
   matching it would readmit the object-literal FP class), and barrels
   living off the defining module's ancestor path.
-- **Phase 3 - polish.** Generic-list tuning, QWeb `t-` directive
-  needles in `static/src/**/*.xml`, breadth-bonus calibration for the
-  enterprise volume (2,300 commits may warrant JS-specific
-  `breadth_bonuses` tiers).
+- **Phase 3 - polish. DONE 2026-06-04.**
+  - **QWeb adoption surface**: `static/src/**/*.xml` is `Language.QWEB`,
+    not VIEW - every VIEW-kind rollout ever recorded there was a
+    cross-namespace FP (194 on the corpus: kanban `record.x.raw_value`
+    expressions matching `Manifest.raw_value`, etc.). JS exports match
+    component tags (`<BadgeTag\\b`); manual `new_view_attribute` pins
+    match attr needles (`data-available-offline`, plain and `t-att-`
+    forms; pinned via `ofd watchlist add --kind new_view_attribute`).
+    Templates under `static/tests/` are skipped like JS test files.
+  - **Surface-only paths** (generic-list tuning, root cause): repo
+    config `surface_only_paths` (workspace: `odoo/upgrade_code/**`,
+    `odoo/cli/**`) - definitions surface as events but never join the
+    watchlist. Migration-script helpers (`change`: 151 bogus rollouts)
+    aren't adoptable APIs.
+  - **NEW_KWARG call-site validation**: every kwarg entry with a
+    `Class.method.kwarg` symbol now requires `kwarg=` inside a call to
+    its method - or any *constructor-shaped* (capitalized) call for
+    `__init__` kwargs, since adopters call subclass constructors. The
+    multi-line `kwarg=value,` fragment (expression_list fingerprint)
+    still counts. Kills `Query.__init__.model` 119, `AssetsBundle.
+    __init__.binary` 127, `is_translatable_attrib.node` 76.
+  - **Generic-list additions**: `unlink` (661 bogus), `request` (359),
+    `raw_value` (149), `fields_get` (45), `attributes` (43),
+    `duplicate` (27), `change`.
+  - **Breadth bonuses: NO JS-specific tiers.** Measured, not guessed:
+    the full-corpus JS adoption maximum is 38 rollouts (localeCompare),
+    which the default 5/20/50 tiers map to +2 - exactly the spread the
+    Python side gets for comparable adoption. Revisit only if a JS
+    primitive ever saturates the 50 tier.
 
 ## Non-goals
 

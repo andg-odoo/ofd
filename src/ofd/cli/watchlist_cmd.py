@@ -16,8 +16,9 @@ import click
 from ofd import config as config_mod
 from ofd import watchlist as watchlist_mod
 from ofd.config import resolve_workspace
-from ofd.events.record import DEFINITION_KINDS
+from ofd.events.record import DEFINITION_KINDS, Kind
 from ofd.events.store import iter_repo, prune_orphan_rollouts
+from ofd.globs import match_any
 
 
 @click.group("watchlist")
@@ -31,12 +32,25 @@ def watchlist_cli():
 @click.option("--short", "short_name", default=None, help="Override short_name (default: last segment).")
 @click.option("--version", "active_version", default=None, help="Series to stamp (default: config active_version).")
 @click.option("--note", default=None, help="Free-form reason / context.")
+@click.option(
+    "--kind",
+    "kind_value",
+    default=None,
+    help=(
+        "Kind to pin as (default: new_decorator_or_helper). The kind "
+        "selects the matching surface: e.g. `new_view_attribute` "
+        "matches attribute needles in views AND OWL templates "
+        "(`data-available-offline`), while the default matches "
+        "Python/views only."
+    ),
+)
 def add(
     symbol: str,
     workspace_path: str | None,
     short_name: str | None,
     active_version: str | None,
     note: str | None,
+    kind_value: str | None,
 ):
     """Pin SYMBOL to the watchlist.
 
@@ -52,11 +66,20 @@ def add(
         click.echo(f"already in watchlist: {symbol}", err=True)
         sys.exit(1)
 
+    kind = Kind.NEW_DECORATOR_OR_HELPER
+    if kind_value is not None:
+        try:
+            kind = Kind(kind_value)
+        except ValueError:
+            click.echo(f"unknown kind: {kind_value}", err=True)
+            sys.exit(2)
+
     entry = wl.add_manual(
         symbol=symbol,
         active_version=version,
         note=note,
         short_name=short_name,
+        kind=kind,
     )
     watchlist_mod.save(wl, workspace)
     click.echo(
@@ -168,6 +191,13 @@ def rebuild(workspace_path: str | None):
         for commit_record in iter_repo(workspace, repo.name):
             for change in commit_record.changes:
                 if change.kind not in DEFINITION_KINDS:
+                    continue
+                # Mirror the pipeline's stage-2 gate: surface-only
+                # paths (migration tooling) never join the watchlist,
+                # and the raws still carry their definition events.
+                if repo.surface_only_paths and match_any(
+                    change.file, repo.surface_only_paths,
+                ):
                     continue
                 seen += 1
                 wl.add_from_definition(

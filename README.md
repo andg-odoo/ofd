@@ -111,12 +111,18 @@ Per commit on the tracked branch:
    A vendored-lib sniff also watches `web/static/lib/owl/owl.js` for
    major-version bumps ("OWL 3 landed" as one epoch event).
 3. **Watchlist update.** Every new definition adds its short name to
-   the watchlist so later commits can be scanned for adoption.
+   the watchlist so later commits can be scanned for adoption - except
+   definitions under a repo's `surface_only_paths` (migration tooling
+   like `odoo/upgrade_code/**`, CLI scripts), which emit scored events
+   but never join: their helpers (`change`, `upgrade`, `tokenize`)
+   aren't adoptable APIs, yet their short names would match everywhere.
 4. **Rollout scan.** Every non-gated changed file's diff is scanned for
    watchlisted short names using context-aware regex patterns. Generic
    names (`join`, `default`, `ids`, ...) require an explicit import to
-   count; ambiguous string matches don't. JS exports match on import
-   lines in `.js` files only.
+   count; ambiguous string matches don't. New kwargs must appear at a
+   call site of their own method (any constructor-shaped call for
+   `__init__` kwargs). JS exports match on import lines in `.js` and
+   component tags in OWL templates.
 5. **Score** each event against commit metadata (core path, tag, key
    devs, intent keywords). Aggregate = definition score + rollout
    breadth bonus + recency floor.
@@ -195,19 +201,28 @@ Names in `_GENERIC_SHORT_NAMES` (`join`, `default`, `ids`, `query`,
 otherwise collide with every `.join()` / `.ids` / `.get()` in the
 codebase.
 
-JS exports (`new_js_export`) match in `.js` files only, and only on
-import lines: `import { name } from "..."` (aliased and fully-added
-multi-line lists included) or `import name from "..."`. The
-from-string must be the defining module, an ancestor barrel of it
-(real adopters import `@web/core/l10n/utils`, not the defining
-`.../utils/collation`), or a relative path - anything else is a
-cross-module name collision (`formatDuration` exists in both
-`formatters` and `l10n/dates`). JS test files are skipped: hoot
-shadows framework helper names by design. Names in
-`_JS_GENERIC_SHORT_NAMES` (OWL component vocabulary, `useService`,
-`registry`, ...) never match: they'd light up every component file.
+JS exports (`new_js_export`) match on import lines in `.js` files:
+`import { name } from "..."` (aliased and fully-added multi-line lists
+included) or `import name from "..."`. The from-string must be the
+defining module, an ancestor barrel of it (real adopters import
+`@web/core/l10n/utils`, not the defining `.../utils/collation`), or a
+relative path - anything else is a cross-module name collision
+(`formatDuration` exists in both `formatters` and `l10n/dates`). JS
+test files are skipped: hoot shadows framework helper names by design.
+Names in `_JS_GENERIC_SHORT_NAMES` (OWL component vocabulary,
+`useService`, `registry`, ...) never match: they'd light up every
+component file.
+
+XML under `static/src/` is QWeb (OWL templates), a separate scope from
+backend views. There, JS exports match component tags (`<BadgeTag`)
+and manual `new_view_attribute` pins match attribute needles
+(`data-available-offline`, plain or `t-att-` form). View-schema
+primitives never match in QWeb and vice versa - every VIEW rollout
+ever recorded there was a cross-namespace FP (kanban
+`record.x.raw_value` expressions matching `Manifest.raw_value`).
+
 No Python/View primitive ever matches in `.js`, and no JS primitive
-in `.py`/`.xml` - kind and file language must agree
+in `.py` or backend views - kind and file language must agree
 (`bench/bench_js.py` re-proves this over the full corpus).
 
 ## Manual watchlist pins
