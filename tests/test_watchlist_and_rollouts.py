@@ -920,3 +920,218 @@ def test_watchlist_from_dict_backward_compat_missing_element():
     }
     wl = Watchlist.from_dict(legacy)
     assert wl.entries["odoo.orm.models_cached.CachedModel"].element is None
+
+
+# --- JS import-anchored adoption matching (DESIGN-js.md phase 2) ----------
+
+
+def _js_watchlist(symbol: str = "@web/core/l10n/utils/collation.localeCompare") -> Watchlist:
+    wl = Watchlist()
+    wl.add_from_definition(
+        ChangeRecord(
+            kind=Kind.NEW_JS_EXPORT,
+            file="addons/web/static/src/core/l10n/utils/collation.js",
+            line=10,
+            symbol=symbol,
+        ),
+        repo="odoo",
+        sha="abc",
+        committed_at="2026-04-01T00:00:00Z",
+        active_version="20.0",
+    )
+    return wl
+
+
+def _js_patch(added: str, file: str = "addons/foo/static/src/foo.js") -> dict[str, str]:
+    lines = "".join(f"+{line}\n" for line in added.splitlines())
+    patch = (
+        f"--- a/{file}\n"
+        f"+++ b/{file}\n"
+        f"@@ -1,1 +1,9 @@\n"
+        f" const x = 1;\n"
+        f"{lines}"
+    )
+    return {file: patch}
+
+
+def test_js_rollout_named_import_any_from_string():
+    """The localeCompare barrel case: the defining module is
+    `@web/core/l10n/utils/collation` but real adopters import the
+    `@web/core/l10n/utils` barrel re-export. Name-anchored matching
+    must count them; a from-string requirement would count zero."""
+    wl = _js_watchlist()
+    records = detect_rollouts(_js_patch(
+        'import { formatList, localeCompare } from "@web/core/l10n/utils";\n'
+        "names.sort(localeCompare);"
+    ), wl, {})
+    assert len(records) == 1
+    assert records[0].kind == Kind.ROLLOUT
+    assert records[0].symbol == "@web/core/l10n/utils/collation.localeCompare"
+
+
+def test_js_rollout_multiline_and_aliased_import():
+    wl = _js_watchlist()
+    multiline = detect_rollouts(_js_patch(
+        "import {\n"
+        "    formatList,\n"
+        "    localeCompare,\n"
+        '} from "@web/core/l10n/utils";'
+    ), wl, {})
+    assert [r.symbol for r in multiline] == [
+        "@web/core/l10n/utils/collation.localeCompare"
+    ]
+    aliased = detect_rollouts(_js_patch(
+        'import { localeCompare as compare } from "@web/core/l10n/utils";'
+    ), wl, {})
+    assert len(aliased) == 1
+
+
+def test_js_rollout_default_import():
+    wl = _js_watchlist("@web/core/py_js/py.evaluateExpr")
+    records = detect_rollouts(_js_patch(
+        'import evaluateExpr from "@web/core/py_js/py";'
+    ), wl, {})
+    assert len(records) == 1
+    with_named = detect_rollouts(_js_patch(
+        'import evaluateExpr, { other } from "@web/core/py_js/py";'
+    ), wl, {})
+    assert len(with_named) == 1
+
+
+def test_js_non_import_use_is_silent():
+    """Import lines are the only recognized position - a bare call,
+    an object key, or a commented-out import never fires. Accepting
+    missed dynamic uses for near-zero false positives is the locked
+    DESIGN-js.md trade."""
+    wl = _js_watchlist()
+    for added in (
+        "const sorted = names.sort(localeCompare);",
+        "export const helpers = { localeCompare };",
+        '// import { localeCompare } from "@web/core/l10n/utils";',
+        ' * import { localeCompare } from "@web/core/l10n/utils";',
+    ):
+        assert detect_rollouts(_js_patch(added), wl, {}) == [], added
+
+
+def test_js_adjacent_imports_no_cross_match():
+    """`[^{}]*` must not let the name anchor bleed across statement
+    boundaries into a neighboring import's brace list. Two statements
+    on one physical line is a known miss (the `^` anchor only sees the
+    first) - a non-case in prettier-formatted Odoo source."""
+    wl = _js_watchlist()
+    records = detect_rollouts(_js_patch(
+        'import { other } from "@web/x";\n'
+        'import { localeCompare } from "@web/core/l10n/utils";'
+    ), wl, {})
+    assert len(records) == 1
+
+
+def test_python_kind_never_matches_in_js():
+    """THE historical FP regression: `PropertiesDefinition.setup` /
+    `Transaction.cache` (Python helpers) matching OWL lifecycle methods
+    and unrelated `cache` properties in JS files. The kind-language
+    gate must drop them before any pattern runs - even on an actual
+    import line carrying the same short name."""
+    wl = Watchlist()
+    for symbol in (
+        "odoo.orm.fields_properties.PropertiesDefinition.setup",
+        "odoo.orm.environments.Transaction.cache",
+    ):
+        wl.add_from_definition(
+            ChangeRecord(
+                kind=Kind.NEW_DECORATOR_OR_HELPER,
+                file="odoo/orm/x.py", line=1, symbol=symbol,
+            ),
+            repo="odoo", sha="abc",
+            committed_at="2026-04-01T00:00:00Z", active_version="20.0",
+        )
+    for added in (
+        "class Foo extends Component {\n"
+        "    setup() {\n"
+        "        this.cache = {};\n"
+        "    }\n"
+        "}",
+        'import { setup } from "@web/core/setup";',
+        'import { cache } from "@web/core/cache";',
+    ):
+        assert detect_rollouts(_js_patch(added), wl, {}) == [], added
+
+
+def test_js_kind_never_matches_in_python_or_xml():
+    """The reverse invariant: a JS export's short name showing up in a
+    .py import or an XML attribute is not an adoption."""
+    wl = _js_watchlist()
+    py_patch = """\
+--- a/m.py
++++ b/m.py
+@@ -1,1 +1,2 @@
+ x = 1
++from odoo.tools import localeCompare
+"""
+    assert detect_rollouts({"m.py": py_patch}, wl, {}) == []
+    xml_patch = """\
+--- a/v.xml
++++ b/v.xml
+@@ -1,1 +1,2 @@
+ <data>
++<field name="localeCompare"/>
+"""
+    assert detect_rollouts({"v.xml": xml_patch}, wl, {}) == []
+
+
+def test_js_generic_short_name_blocked():
+    """A new export colliding with OWL/core vocabulary would match the
+    `import { useService } from ...` line in every component file -
+    the blocklist drops such entries in JS scope entirely."""
+    wl = _js_watchlist("@web/core/new_hooks.useService")
+    records = detect_rollouts(_js_patch(
+        'import { useService } from "@web/core/utils/hooks";'
+    ), wl, {})
+    assert records == []
+
+
+def test_js_test_files_skipped():
+    """Hoot shadows framework helper names (`waitUntil`, `waitFor`,
+    `click`, ...), so an import line in a test file systematically
+    attributes hoot's helper to a same-named framework export. Test
+    imports aren't adoption stories even when genuine - the whole
+    surface is skipped."""
+    wl = _js_watchlist("@web/core/macro.waitUntil")
+    added = 'import { describe, expect, test, waitUntil } from "@odoo/hoot";'
+    for file in (
+        "addons/iot/static/tests/unit/iot_websocket.test.js",
+        "ai_website/static/tests/ai_website_builder.test.js",
+        "addons/point_of_sale/static/tests/unit/utils.js",
+    ):
+        assert detect_rollouts(_js_patch(added, file=file), wl, {}) == [], file
+    # The same import in a non-test file still counts.
+    real = detect_rollouts(_js_patch(
+        'import { waitUntil } from "@web/core/macro";',
+        file="web_studio/static/src/client_action/editor.js",
+    ), wl, {})
+    assert len(real) == 1
+
+
+def test_js_from_string_must_be_plausible():
+    """Name-anchored matching alone misattributes cross-module name
+    collisions: `formatDuration` is exported independently by both
+    `@web/views/fields/formatters` (watchlisted) and the pre-floor
+    `@web/core/l10n/dates`. The from-string must be the defining
+    module, an ancestor barrel of it, or a relative path."""
+    wl = _js_watchlist("@web/views/fields/formatters.formatDuration")
+    # The colliding export from another module: silent.
+    assert detect_rollouts(_js_patch(
+        'import { formatDuration } from "@web/core/l10n/dates";'
+    ), wl, {}) == []
+    # Defining module: counts.
+    assert len(detect_rollouts(_js_patch(
+        'import { formatDuration } from "@web/views/fields/formatters";'
+    ), wl, {})) == 1
+    # Ancestor barrel: counts (the localeCompare 42/42 case).
+    assert len(detect_rollouts(_js_patch(
+        'import { formatDuration } from "@web/views/fields";'
+    ), wl, {})) == 1
+    # Relative same-addon import: counts (can't collide cross-addon).
+    assert len(detect_rollouts(_js_patch(
+        'import { formatDuration } from "./formatters";'
+    ), wl, {})) == 1

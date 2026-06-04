@@ -1,8 +1,9 @@
 # JS extractor - design spec
 
-Status: SPEC ONLY - nothing here is implemented. Companion to
-[DESIGN.md](DESIGN.md); assumes its vocabulary (kinds, watchlist,
-rollout matcher, baselines, bench harness).
+Status: phases 1 and 2 implemented (definitions + import-anchored
+adoption matching); phase 3 (QWeb needles, breadth calibration) is
+spec only. Companion to [DESIGN.md](DESIGN.md); assumes its vocabulary
+(kinds, watchlist, rollout matcher, baselines, bench harness).
 
 ## Goal
 
@@ -97,12 +98,17 @@ The path->alias transform is `addons/<addon>/static/src/<rest>.js ->
      added diff line. ~~Bonus precision: when the entry's module alias
      is known, require the from-string to match it.~~ **Disproved by
      Phase 1 data (2026-06-04):** `localeCompare` is defined in
-     `@web/core/l10n/utils/collation` but all 28 real odoo adopters
-     import it from the `@web/core/l10n/utils` barrel re-export. A
-     strict from-string match counts zero of them. The matcher must
-     anchor on the imported *name* with any from-string (or track
-     re-export barrels). Add the localeCompare barrel case to the
-     bench corpus as a must-match.
+     `@web/core/l10n/utils/collation` but all real adopters (42/42 on
+     the bench corpus) import it from the `@web/core/l10n/utils`
+     barrel re-export. A strict from-string match counts zero of them.
+     **Implemented rule (`_js_from_plausible`):** the from-string must
+     be the defining module, an *ancestor barrel* on its path, or a
+     relative path. Pure name-anchoring was also disproved by the
+     bench: `formatDuration` is exported independently by both
+     `@web/views/fields/formatters` (watchlisted) and the pre-floor
+     `@web/core/l10n/dates`, and hoot shadows framework helper names
+     in test files (`waitUntil`: 11 of 13 raw hits were hoot's) - JS
+     test files (`static/tests/`, `*.test.js`) are skipped wholesale.
   2. `registry.category("CAT").add(` for category entries (extractor-
      emitted, see above; not the content matcher).
 - JS generic-short-name blocklist, mirroring `_GENERIC_SHORT_NAMES`:
@@ -133,11 +139,10 @@ What remains, and how the refactor still gets marked:
    entry instead of scattered noise. The migration tooling itself
    (`owl3-migration.py`, `tools_js_expressions.py`) is already
    surfaced by the broadened `upgrade_code/**` paths.
-2. **Rename folding (cheap insurance).** Within one commit + one file,
-   a removed export whose body reappears under a new name is one
-   `SIGNATURE_CHANGE`-style event, not `REMOVED_JS_EXPORT` +
-   `NEW_JS_EXPORT` at 3+2. Exact-body match only; no similarity
-   scoring. If the bench shows it never fires, delete it.
+2. **Rename folding (cheap insurance). DELETED in phase 2:** it never
+   fired across the full 19,774-commit reindex, triggering this
+   paragraph's own delete rule. A rename is now an honest
+   `REMOVED_JS_EXPORT` + `NEW_JS_EXPORT` pair.
 3. **No special JS floor.** The standard `since_date` baseline
    applies. If backfill still proves noisy around the merge window,
    fall back to a `js_since_date` per-repo knob - but only with bench
@@ -178,11 +183,22 @@ What remains, and how the refactor still gets marked:
   (b) NEW_REGISTRY_CATEGORY was implemented wide-scope (addon-invented
   registries count) - that's what surfaced web_studio's
   `editor_fields` from enterprise; tighten only if it gets noisy.
-- **Phase 2 - adoption.** Import-anchored matcher + registry rollouts
-  + baselines. Gate: bench corpus must include the historical false
-  positives (`PropertiesDefinition.setup`, `Transaction.cache`) as
-  must-not-match regression cases, plus a hand-labeled sample of ~50
-  true adoptions (import lines from real enterprise commits).
+- **Phase 2 - adoption. DONE 2026-06-04.** Import-anchored matcher
+  (`rollouts._js_import_pattern`: named/aliased/multi-line/default
+  import forms) + `_js_from_plausible` (defining module / ancestor
+  barrel / relative path), `Language.JS` rows for NEW_JS_EXPORT and
+  REMOVED_JS_EXPORT only, `_JS_GENERIC_SHORT_NAMES` blocklist (OWL
+  vocabulary + ubiquitous `@web/core` exports), JS test files skipped
+  (hoot name-shadowing). Gate run as `bench/bench_js.py` over the full
+  real corpus (7,129 JS-touching commits): the historical false
+  positives (`PropertiesDefinition.setup`, `Transaction.cache`) are
+  live watchlist entries, so a full-corpus scan asserting zero
+  non-JS-kind rollouts in .js files IS the must-not-match regression;
+  matched import lines dumped to `bench/js_adoptions.jsonl` and
+  hand-verified per symbol. Known accepted misses: a name appended to
+  an existing multi-line import list (diff shows a bare `NAME,` line -
+  matching it would readmit the object-literal FP class), and barrels
+  living off the defining module's ancestor path.
 - **Phase 3 - polish.** Generic-list tuning, QWeb `t-` directive
   needles in `static/src/**/*.xml`, breadth-bonus calibration for the
   enterprise volume (2,300 commits may warrant JS-specific

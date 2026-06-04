@@ -10,14 +10,15 @@ for generic names like `join`, `default`, `help`. The pipeline applies
 four filtering stages, in order:
 
 0. Language gate (`_file_language` + `_KIND_LANGUAGES`). Files whose
-   extension isn't in `_FILE_LANGUAGES` (.py, .xml, .rng) are skipped
-   wholesale - we don't extract primitives from .js / .po / .csv /
+   extension isn't in `_FILE_LANGUAGES` (.py, .xml, .rng, .js) are
+   skipped wholesale - we don't extract primitives from .po / .csv /
    .html, so a Python primitive matching `setup()` on every OWL
    component or a context-key name appearing as a JS Record field is a
    pure cross-language false positive. Within a scanned file, entries
    whose source language doesn't include this file's language are
    dropped (NEW_KWARG `compute_sql` doesn't fire in XML; NEW_VIEW_*
-   doesn't fire in .py).
+   doesn't fire in .py; JS exports match only on import lines in .js,
+   never the other way around).
 
 1. Aho-Corasick prefilter (`_Matcher.automaton`). One pass over the
    patch reports which watchlisted short names are present. Replaces
@@ -94,6 +95,7 @@ _RELAX_GENERIC_KINDS = frozenset({
 class Language(StrEnum):
     PY = "py"      # Python source (.py)
     VIEW = "view"  # XML / RNG view source (.xml, .rng)
+    JS = "js"      # JavaScript source (.js)
 
 
 # Languages each primitive kind can legitimately adopt in. A diff file's
@@ -134,15 +136,18 @@ _KIND_LANGUAGES: dict[Kind, frozenset[Language]] = {
     # (a module *adding* a file with the watchlisted basename), so
     # content scanning never applies.
     Kind.NEW_FILE_CONVENTION:       frozenset(),
-    # JS primitives (DESIGN-js.md). Phase 1 is definitions-only: no
-    # content matching anywhere. Phase 2 (import-anchored matching,
-    # bench-gated with PropertiesDefinition.setup / Transaction.cache
-    # as must-not-match regressions) will introduce Language.JS for
-    # exactly these kinds. INVARIANT: never add Language.JS to any
-    # Python/View kind above - cross-language content matching is the
-    # documented false-positive factory. Registry-category adoptions
-    # are emitted by the js_ extractor itself, like file conventions.
-    Kind.NEW_JS_EXPORT:             frozenset(),
+    # JS primitives (DESIGN-js.md, phase 2). Exports adopt via import
+    # lines only (`_js_import_pattern`) - JS-only by construction.
+    # INVARIANT: never add Language.JS to any Python/View kind above -
+    # cross-language content matching is the documented false-positive
+    # factory (PropertiesDefinition.setup / Transaction.cache).
+    # REMOVED_JS_EXPORT isn't a definition kind so its row is inert;
+    # it carries JS for symmetry with REMOVED_PUBLIC_SYMBOL.
+    Kind.NEW_JS_EXPORT:             frozenset({Language.JS}),
+    Kind.REMOVED_JS_EXPORT:         frozenset({Language.JS}),
+    # Registry adoptions are emitted by the js_ extractor itself, like
+    # file conventions - a category/entry short name ("tooltips") has
+    # no import-line adoption shape, so the content matcher never runs.
     Kind.NEW_REGISTRY_CATEGORY:     frozenset(),
     Kind.NEW_REGISTRY_ENTRY:        frozenset(),
     Kind.VENDORED_LIB_BUMP:         frozenset(),
@@ -158,15 +163,18 @@ _GENERIC_BLOCKED_IN_VIEW: frozenset[Kind] = frozenset({
     Kind.NEW_CLASS_ATTRIBUTE,
 })
 
-# File extension -> language. Files outside this map (.js, .po, .csv,
+# File extension -> language. Files outside this map (.po, .csv,
 # .html, .scss, ...) are skipped wholesale. We don't extract primitives
 # from those formats, and matching Python/View primitives there has
 # only produced false positives in the wild (the entire JS rollout
 # column of `PropertiesDefinition.setup` and `Transaction.cache` was
 # bogus - OWL lifecycle methods and unrelated `cache` properties).
+# `.js` maps to a language whose only members are the JS kinds, so
+# Python/View primitives still never scan a JS file and vice versa.
 _FILE_LANGUAGES: tuple[tuple[tuple[str, ...], Language], ...] = (
     ((".py",), Language.PY),
     ((".xml", ".rng"), Language.VIEW),
+    ((".js",), Language.JS),
 )
 
 # Names that alias too many unrelated builtins / common idioms to be
@@ -195,6 +203,28 @@ _GENERIC_SHORT_NAMES: frozenset[str] = frozenset({
     "__contains__",
 })
 
+# JS short names blocked from import-anchored matching. Import lines
+# are name-anchored with *any* from-string (the localeCompare barrel
+# finding, DESIGN-js.md), so a new export colliding with one of these
+# would match the existing `import { Component } from "@odoo/owl"` in
+# every component file. OWL's public vocabulary plus the handful of
+# `@web/core` exports cited from nearly every addon. With import-only
+# anchoring this list is belt-and-suspenders, but the historical
+# PropertiesDefinition.setup / Transaction.cache failures earn it.
+_JS_GENERIC_SHORT_NAMES: frozenset[str] = frozenset({
+    # OWL component vocabulary + lifecycle hooks.
+    "Component", "App", "EventBus", "xml", "css", "markup", "mount",
+    "reactive", "toRaw", "status", "validate", "whenReady", "loadFile",
+    "useState", "useRef", "useEffect", "useEnv", "useSubEnv",
+    "useChildSubEnv", "useComponent", "useExternalListener",
+    "onMounted", "onWillStart", "onWillUnmount", "onWillUpdateProps",
+    "onWillRender", "onRendered", "onPatched", "onWillDestroy",
+    "onError", "setup", "props", "state", "env", "render", "template",
+    # `@web/core` exports imported from nearly every addon file.
+    "registry", "useService", "useBus", "browser", "session", "user",
+    "rpc", "Domain", "memoize", "debounce", "throttleForAnimation",
+})
+
 
 @lru_cache(maxsize=512)
 def _directive_pattern(name: str) -> re.Pattern[str]:
@@ -214,6 +244,61 @@ def _directive_pattern(name: str) -> re.Pattern[str]:
     """
     n = re.escape(name)
     return re.compile(rf"<{n}\b")
+
+
+@lru_cache(maxsize=512)
+def _js_import_pattern(name: str) -> re.Pattern[str]:
+    """Import-anchored pattern for JS export adoption (DESIGN-js.md).
+
+    Exactly two recognized positions, both statement-anchored:
+
+      - named import: `import { ..., NAME, ... } from "..."` (covers
+        aliased `NAME as x` and fully-added multi-line import lists -
+        `[^{}]*` spans newlines but can't cross into a second import
+        statement)
+      - default import: `import NAME from "..."` / `import NAME, {...}`
+
+    The from-string is captured (group 1 or 2, one per alternative) so
+    `_js_from_plausible` can reject cross-module name collisions.
+
+    Known miss, accepted: a single name appended to an *existing*
+    multi-line import list shows up in the diff as a bare `NAME,` line
+    with no `import` keyword in the added blob. Matching that shape
+    would mean matching every object-literal / destructuring line, the
+    exact FP class import-anchoring exists to avoid.
+    """
+    n = re.escape(name)
+    return re.compile(
+        rf"(?:^\s*import\s*\{{[^{{}}]*\b{n}\b[^{{}}]*\}}\s*from\s*['\"]([^'\"]+)['\"])"
+        rf"|(?:^\s*import\s+{n}\s*(?:,[^;\n]*?)?\s*from\s*['\"]([^'\"]+)['\"])",
+        re.MULTILINE,
+    )
+
+
+def _js_from_plausible(from_str: str, module: str) -> bool:
+    """Could an import from `from_str` resolve to a symbol defined in
+    `module` (an asset alias like `@web/core/l10n/utils/collation`)?
+
+    Accepted sources, all proven on the 2026-06-04 bench corpus:
+
+      - the defining module itself;
+      - any ancestor barrel on its path: every real `localeCompare`
+        adopter (42/42) imports `@web/core/l10n/utils`, not the
+        defining `.../utils/collation` - Odoo barrels re-export from
+        an index file at a parent path;
+      - a relative path (`./badge_tag`): same-addon imports can't be
+        resolved cheaply here, and a cross-addon collision can't be
+        relative, so accept.
+
+    Everything else is a cross-module name collision - the bench
+    counter-case is `formatDuration`, exported independently by both
+    `@web/views/fields/formatters` (watchlisted) and the pre-floor
+    `@web/core/l10n/dates`; name-only anchoring misattributed every
+    import of the latter to the former.
+    """
+    if from_str.startswith("."):
+        return True
+    return module == from_str or module.startswith(from_str + "/")
 
 
 @lru_cache(maxsize=512)
@@ -845,12 +930,26 @@ def _file_language(path: str) -> Language | None:
     to skip the file entirely.
 
     Skipping (returning None) is what kills the cross-language FP class:
-    we don't run Python/View regexes against `.js` / `.po` / `.css`
-    files at all. The contextual regex's `py_other` scope is preserved
+    we don't run any regexes against `.po` / `.css` files at all, and
+    `.js` files only ever see the import-anchored patterns of JS kinds
+    (the kind-language gate drops Python/View entries before lookup).
+    The contextual regex's `py_other` scope is preserved
     internally for the strict-on-py fallback (generic-named decorator
     helpers like `join` keep the import-only gate even on .py files),
     but no file path resolves to it any more.
+
+    JS test files are skipped outright: hoot (the JS test framework)
+    deliberately shadows framework helper names (`waitUntil`,
+    `waitFor`, `click`, ...), so import lines in test files
+    systematically attribute hoot imports to same-named framework
+    exports (bench 2026-06-04: 11 of 13 `macro.waitUntil` hits were
+    hoot's). A test-file import isn't an adoption story even when
+    genuine, so the whole surface goes.
     """
+    if path.endswith(".js") and (
+        "/static/tests/" in path or path.endswith(".test.js")
+    ):
+        return None
     for exts, lang in _FILE_LANGUAGES:
         if path.endswith(exts):
             return lang
@@ -861,12 +960,21 @@ def _build_matcher(watchlist: Watchlist) -> _Matcher:
     by_short: dict[str, list] = {}
     for entry in sorted(watchlist.entries.values(), key=lambda e: e.symbol):
         by_short.setdefault(entry.short_name, []).append(entry)
-    # Only PY and VIEW scopes - non-source files are dropped before
-    # we look up a pattern (see `_file_language`).
+    # Non-source files are dropped before we look up a pattern (see
+    # `_file_language`).
     compiled_by_scope: dict[str, dict[str, re.Pattern[str]]] = {
-        Language.PY: {}, Language.VIEW: {},
+        Language.PY: {}, Language.VIEW: {}, Language.JS: {},
     }
     for entry in watchlist.entries.values():
+        # JS kinds adopt in JS scope only (import lines); they never
+        # need a PY/VIEW pattern, and no Python/View kind ever gets a
+        # JS one - the language gate in detect_rollouts drops them
+        # before pattern lookup.
+        if Language.JS in _KIND_LANGUAGES.get(entry.kind, frozenset()):
+            compiled_by_scope[Language.JS][entry.symbol] = _js_import_pattern(
+                entry.short_name,
+            )
+            continue
         # Context keys get a dedicated tight pattern (rejects the bare
         # `.attribute` form on shared-name model fields). They're PY-only
         # by `_KIND_LANGUAGES`, so we don't compile a VIEW pattern.
@@ -1026,6 +1134,7 @@ def detect_rollouts(
         compiled = matcher.compiled_by_scope[file_lang]
         is_py = file_lang is Language.PY
         is_view = file_lang is Language.VIEW
+        is_js = file_lang is Language.JS
         for hunk in _parse_patch(patch):
             added_blob = _strip_comments("\n".join(hunk.raw_added))
             if not added_blob.strip():
@@ -1061,7 +1170,11 @@ def detect_rollouts(
                 # (a NEW_DECORATOR_OR_HELPER `name` would match every
                 # `<field name=.../>` even though the entry can
                 # legitimately appear in XML when the name is specific
-                # like `formatted_display_name`).
+                # like `formatted_display_name`). In JS scope, drop
+                # OWL-vocabulary names: import matching is from-string
+                # agnostic, so a colliding export would match the
+                # `import { Component } from "@odoo/owl"` line in
+                # every component file.
                 group = [
                     e for e in group
                     if file_lang in _KIND_LANGUAGES[e.kind]
@@ -1069,6 +1182,10 @@ def detect_rollouts(
                         is_view
                         and e.kind in _GENERIC_BLOCKED_IN_VIEW
                         and e.short_name in _GENERIC_SHORT_NAMES
+                    )
+                    and not (
+                        is_js
+                        and e.short_name in _JS_GENERIC_SHORT_NAMES
                     )
                 ]
                 if not group:
@@ -1090,6 +1207,18 @@ def detect_rollouts(
                             if not _ancestor_qualifies(_xml_root_for(file), entry):
                                 continue
                         records.append(_make_record(file, hunk, entry))
+                elif is_js:
+                    # Per-entry matching: two JS exports can share a
+                    # short name with different defining modules, and
+                    # the from-string plausibility check is what tells
+                    # them apart (formatDuration: formatters vs dates).
+                    for entry in group:
+                        module = entry.symbol.rsplit(".", 1)[0]
+                        if any(
+                            _js_from_plausible(m.group(1) or m.group(2), module)
+                            for m in compiled[entry.symbol].finditer(added_blob)
+                        ):
+                            records.append(_make_record(file, hunk, entry))
                 elif is_py and (methods := _kwarg_method_targets(group)) is not None:
                     # NEW_KWARG entries share the same short name across
                     # different methods (e.g. `Field.to_sql.table` vs

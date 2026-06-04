@@ -115,7 +115,8 @@ Per commit on the tracked branch:
 4. **Rollout scan.** Every non-gated changed file's diff is scanned for
    watchlisted short names using context-aware regex patterns. Generic
    names (`join`, `default`, `ids`, ...) require an explicit import to
-   count; ambiguous string matches don't.
+   count; ambiguous string matches don't. JS exports match on import
+   lines in `.js` files only.
 5. **Score** each event against commit metadata (core path, tag, key
    devs, intent keywords). Aggregate = definition score + rollout
    breadth bonus + recency floor.
@@ -161,15 +162,13 @@ matcher never scans for it).
 
 JS extractor: `new_js_export`, `removed_js_export` (export diff over
 framework `static/src` paths; exported hooks are stamped for ledger
-display; same-commit renames fold into one `signature_change`),
-`new_registry_category`, `new_registry_entry` (the
+display), `new_registry_category`, `new_registry_entry` (the
 `registry.category("x").add("y", ...)` typed-string registry; category
 adoptions are emitted by the extractor itself, like file conventions),
 and `vendored_lib_bump` (major-version change of a tracked vendored
-bundle, e.g. OWL). All JS kinds are definitions-only for now: the
-content matcher never scans for them (cross-language matching is the
-documented false-positive factory); import-anchored adoption matching
-is phase 2 of `DESIGN-js.md` and bench-gated.
+bundle, e.g. OWL). JS exports adopt via import-anchored matching only
+(see below); registry and lib-bump kinds are never content-matched
+(cross-language matching is the documented false-positive factory).
 
 Rollout detector: `rollout` (one per hit per hunk; carries before/after
 snippets for slide content).
@@ -195,6 +194,21 @@ Names in `_GENERIC_SHORT_NAMES` (`join`, `default`, `ids`, `query`,
 `cache`, dunders, ...) only count when imported explicitly - they'd
 otherwise collide with every `.join()` / `.ids` / `.get()` in the
 codebase.
+
+JS exports (`new_js_export`) match in `.js` files only, and only on
+import lines: `import { name } from "..."` (aliased and fully-added
+multi-line lists included) or `import name from "..."`. The
+from-string must be the defining module, an ancestor barrel of it
+(real adopters import `@web/core/l10n/utils`, not the defining
+`.../utils/collation`), or a relative path - anything else is a
+cross-module name collision (`formatDuration` exists in both
+`formatters` and `l10n/dates`). JS test files are skipped: hoot
+shadows framework helper names by design. Names in
+`_JS_GENERIC_SHORT_NAMES` (OWL component vocabulary, `useService`,
+`registry`, ...) never match: they'd light up every component file.
+No Python/View primitive ever matches in `.js`, and no JS primitive
+in `.py`/`.xml` - kind and file language must agree
+(`bench/bench_js.py` re-proves this over the full corpus).
 
 ## Manual watchlist pins
 
