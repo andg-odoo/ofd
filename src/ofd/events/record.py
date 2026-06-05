@@ -28,6 +28,8 @@ class Kind(StrEnum):
     NEW_CONTEXT_KEY = "new_context_key"
     NEW_FILE_CONVENTION = "new_file_convention"
     NEW_MANIFEST_KEY = "new_manifest_key"
+    NEW_MODULE = "new_module"
+    REMOVED_MODULE = "removed_module"
     DEPENDENCY_CHANGE = "dependency_change"
     NEW_JS_EXPORT = "new_js_export"
     REMOVED_JS_EXPORT = "removed_js_export"
@@ -49,6 +51,7 @@ DEFINITION_KINDS = frozenset({
     Kind.NEW_CONTEXT_KEY,
     Kind.NEW_FILE_CONVENTION,
     Kind.NEW_MANIFEST_KEY,
+    Kind.NEW_MODULE,
     Kind.DEPENDENCY_CHANGE,
     Kind.NEW_JS_EXPORT,
     Kind.NEW_REGISTRY_CATEGORY,
@@ -103,6 +106,10 @@ class ChangeRecord:
     model: str | None = None
     xml_path: str | None = None
     hunk_header: str | None = None
+    # NEW_MODULE only: manifest declares `auto_install` - a bridge
+    # module, glue rather than a story. Set to True or left None (never
+    # False) so `to_dict`'s None-filter keeps other kinds' JSON clean.
+    auto_install: bool | None = None
 
     def to_dict(self) -> dict:
         raw = asdict(self)

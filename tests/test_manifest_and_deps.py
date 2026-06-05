@@ -7,7 +7,7 @@ from ofd import state as state_mod
 from ofd import watchlist as watchlist_mod
 from ofd.events.record import Kind
 from ofd.events.store import iter_repo
-from ofd.extractors import dependencies, manifest_keys
+from ofd.extractors import dependencies, manifest_keys, modules
 from ofd.pipeline import run as run_pipeline
 from tests.fixtures.repo_builder import make_repo
 
@@ -80,6 +80,80 @@ def test_manifest_test_modules_skipped():
         "{'bogus_loader_key': 1}",
     )]
     assert manifest_keys.extract(files, frozenset(), frozenset()) == []
+
+
+# --- modules: unit -----------------------------------------------------------
+
+
+def test_new_and_removed_module():
+    new = modules.extract(
+        [("addons/base_report_pm/__manifest__.py", None,
+          "{'name': 'Paper Muncher', 'category': 'Technical',"
+          " 'depends': ['base']}")],
+        known_symbols=frozenset(),
+    )
+    assert [(r.kind, r.symbol, r.signature, r.auto_install) for r in new] == [
+        (Kind.NEW_MODULE, "module.base_report_pm",
+         "Paper Muncher (Technical)", None),
+    ]
+    removed = modules.extract(
+        [("addons/base_report_pm/__manifest__.py",
+          "{'name': 'Paper Muncher'}", None)],
+        known_symbols=frozenset(),
+    )
+    assert [(r.kind, r.symbol) for r in removed] == [
+        (Kind.REMOVED_MODULE, "module.base_report_pm"),
+    ]
+
+
+def test_module_bridge_carries_auto_install():
+    records = modules.extract(
+        [("addons/pos_self_order_qfpay/__manifest__.py", None,
+          "{'name': 'Bridge', 'auto_install': True, 'depends': ['pos_qfpay']}")],
+        known_symbols=frozenset(),
+    )
+    assert records[0].kind is Kind.NEW_MODULE
+    assert records[0].auto_install is True
+
+
+def test_module_depends_rollout():
+    # An existing manifest adding a tracked module to depends is the
+    # adoption surface; untracked additions stay silent.
+    records = modules.extract(
+        [("addons/mail/__manifest__.py",
+          "{'name': 'Mail', 'depends': ['base']}",
+          "{'name': 'Mail',\n 'depends': ['base', 'paper_muncher', 'web']}")],
+        known_symbols=frozenset({"module.paper_muncher"}),
+    )
+    assert [(r.kind, r.symbol, r.line) for r in records] == [
+        (Kind.ROLLOUT, "module.paper_muncher", 2),
+    ]
+
+
+def test_module_same_commit_bridge_adoption():
+    # A module landing together with its bridge: the bridge's depends
+    # is the new module's first rollout, same-commit.
+    records = modules.extract(
+        [
+            ("addons/pm/__manifest__.py", None, "{'name': 'PM'}"),
+            ("addons/pm_bridge/__manifest__.py", None,
+             "{'name': 'PM Bridge', 'auto_install': True, 'depends': ['pm']}"),
+        ],
+        known_symbols=frozenset(),
+    )
+    assert [(r.kind, r.symbol) for r in records] == [
+        (Kind.NEW_MODULE, "module.pm"),
+        (Kind.NEW_MODULE, "module.pm_bridge"),
+        (Kind.ROLLOUT, "module.pm"),
+    ]
+
+
+def test_module_test_modules_and_unparseable_skipped():
+    files = [
+        ("odoo/addons/test_new_api/__manifest__.py", None, "{'name': 'T'}"),
+        ("addons/broken/__manifest__.py", None, "not a manifest {"),
+    ]
+    assert modules.extract(files, known_symbols=frozenset()) == []
 
 
 # --- requirements.txt: unit --------------------------------------------------
@@ -202,10 +276,12 @@ def test_end_to_end_manifest_and_requirements(tmp_path: Path, monkeypatch):
     a = records[key_sha].changes
     assert [(c.kind, c.symbol) for c in a] == [
         (Kind.NEW_MANIFEST_KEY, "manifest.countries"),
+        (Kind.NEW_MODULE, "module.l10n_de"),
     ]
     b = records[adopt_sha].changes
     assert [(c.kind, c.symbol) for c in b] == [
         (Kind.ROLLOUT, "manifest.countries"),
+        (Kind.NEW_MODULE, "module.l10n_fr"),
     ]
     c = records[dep_sha].changes
     assert [(x.kind, x.symbol, x.symbol_hint) for x in c] == [
@@ -215,5 +291,88 @@ def test_end_to_end_manifest_and_requirements(tmp_path: Path, monkeypatch):
 
     persisted = watchlist_mod.load(workspace)
     assert "manifest.countries" in persisted.entries
+    assert "module.l10n_de" in persisted.entries
     # Baseline keys never became primitives.
     assert "manifest.version" not in persisted.entries
+    # Pre-floor modules never became primitives either.
+    assert "module.base" not in persisted.entries
+
+
+def test_end_to_end_module_lifecycle(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    repo = make_repo(tmp_path)
+
+    # Pre-floor baseline: carries every manifest key used below so the
+    # manifest-key extractor stays silent and only module events fire.
+    repo.commit(
+        {"addons/base/__manifest__.py":
+            "{'name': 'Base', 'depends': [], 'version': '1.0',"
+            " 'category': 'Hidden', 'auto_install': False}\n"},
+        subject="[ADD] base: initial",
+        env=_dated("2025-01-15"),
+    )
+
+    # A: new module + its auto_install bridge in one commit.
+    add_sha = repo.commit(
+        {
+            "addons/paper_muncher/__manifest__.py":
+                "{'name': 'Paper Muncher', 'category': 'Technical',"
+                " 'depends': ['base']}\n",
+            "addons/pm_bridge/__manifest__.py":
+                "{'name': 'PM Bridge', 'auto_install': True,"
+                " 'depends': ['paper_muncher']}\n",
+        },
+        subject="[ADD] paper_muncher: new report engine",
+        env=_dated("2025-07-01"),
+    )
+    # B: an existing module adopts it via depends.
+    adopt_sha = repo.commit(
+        {"addons/base/__manifest__.py":
+            "{'name': 'Base', 'depends': ['paper_muncher'], 'version': '1.0',"
+            " 'category': 'Hidden', 'auto_install': False}\n"},
+        subject="[IMP] base: render through paper_muncher",
+        env=_dated("2025-07-02"),
+    )
+    # C: the bridge dies.
+    rem_sha = repo.commit(
+        {"addons/pm_bridge/__manifest__.py": None},
+        subject="[REM] pm_bridge: fold into paper_muncher",
+        env=_dated("2025-07-03"),
+    )
+
+    workspace = tmp_path / "ws"
+    _write_config(workspace, repo.bare)
+    config = config_mod.load(workspace)
+    state = state_mod.load()
+    watchlist = watchlist_mod.load(workspace)
+
+    summary = run_pipeline(config, state, watchlist)
+    assert not summary.errors, summary.errors
+
+    records = {cr.commit.sha: cr for cr in iter_repo(workspace, "odoo")}
+    assert set(records) == {add_sha, adopt_sha, rem_sha}
+
+    a = {(c.kind, c.symbol): c for c in records[add_sha].changes}
+    assert set(a) == {
+        (Kind.NEW_MODULE, "module.paper_muncher"),
+        (Kind.NEW_MODULE, "module.pm_bridge"),
+        (Kind.ROLLOUT, "module.paper_muncher"),
+    }
+    # [ADD] commit: base 2 + tag 1 = 3 (surface); the bridge's
+    # auto_install penalty sinks it back to 2.
+    assert a[(Kind.NEW_MODULE, "module.paper_muncher")].score == 3
+    assert a[(Kind.NEW_MODULE, "module.pm_bridge")].score == 2
+
+    b = records[adopt_sha].changes
+    assert [(c.kind, c.symbol, c.file) for c in b] == [
+        (Kind.ROLLOUT, "module.paper_muncher", "addons/base/__manifest__.py"),
+    ]
+
+    c = records[rem_sha].changes
+    assert [(x.kind, x.symbol, x.signature) for x in c] == [
+        (Kind.REMOVED_MODULE, "module.pm_bridge", "PM Bridge"),
+    ]
+
+    persisted = watchlist_mod.load(workspace)
+    assert "module.paper_muncher" in persisted.entries
+    assert persisted.entries["module.paper_muncher"].kind is Kind.NEW_MODULE

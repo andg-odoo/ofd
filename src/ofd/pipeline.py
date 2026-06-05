@@ -32,6 +32,7 @@ from ofd.extractors import (
     file_conventions,
     js_,
     manifest_keys,
+    modules,
 )
 from ofd.extractors.dispatcher import extract_for_file
 from ofd.globs import match_any
@@ -276,11 +277,15 @@ def process_commit(
     if conv_added:
         changes.extend(file_conventions.extract(conv_added, watchlist.entries))
 
-    # --- stage 1.65: manifest-key detection ---
+    # --- stage 1.65: manifest-key + module detection ---
     # Wide-scope like context keys. Manifests churn constantly (version
-    # bumps, depends edits), so gate on an added key-shaped line in the
-    # patch before paying the parent/child fetch + parse; the exact
-    # ast diff then keeps only genuinely new top-level keys.
+    # bumps, depends edits), so gate on cheap patch checks before
+    # paying the parent/child fetch + parse:
+    #   - an added key-shaped line feeds the manifest-key diff;
+    #   - an added/deleted manifest file is a new/removed module;
+    #   - an added line quoting a tracked (or same-commit-added) module
+    #     name is a candidate depends-rollout.
+    # The exact ast diffs downstream keep only genuine events.
     manifest_files = [
         f for f in all_files
         if f.endswith("__manifest__.py")
@@ -289,17 +294,38 @@ def process_commit(
     if manifest_files:
         if all_patches is None:
             all_patches = gitio.commit_diff_by_file(repo.mirror, sha)
+        module_needles = {
+            e.short_name for e in watchlist.entries.values()
+            if e.kind is Kind.NEW_MODULE
+        }
+        module_needles.update(
+            modules.module_name(f) for f in manifest_files
+            if "\nnew file mode " in all_patches.get(f, "")
+        )
         gated_manifests: list[tuple[str, str | None, str | None]] = []
+        module_manifests: list[tuple[str, str | None, str | None]] = []
         for file in manifest_files:
-            if not _MANIFEST_KEY_LINE.search(all_patches.get(file, "")):
+            patch = all_patches.get(file, "")
+            key_shaped = bool(_MANIFEST_KEY_LINE.search(patch))
+            added_or_deleted = (
+                "\nnew file mode " in patch or "\ndeleted file mode " in patch
+            )
+            dep_needle = any(
+                f"'{n}'" in patch or f'"{n}"' in patch for n in module_needles
+            )
+            if not (key_shaped or added_or_deleted or dep_needle):
                 continue
-            gated_manifests.append((
-                file, _fetch(f"{sha}^", file), _fetch(sha, file),
-            ))
+            pair = (file, _fetch(f"{sha}^", file), _fetch(sha, file))
+            if key_shaped:
+                gated_manifests.append(pair)
+            if added_or_deleted or dep_needle:
+                module_manifests.append(pair)
         if gated_manifests:
             changes.extend(manifest_keys.extract(
                 gated_manifests, watchlist.entries, baseline_manifest_keys,
             ))
+        if module_manifests:
+            changes.extend(modules.extract(module_manifests, watchlist.entries))
 
     # --- stage 1.7: wide-scope JS registry scan ---
     # `registry.category("x").add("y", ...)` lives mostly in addons,

@@ -39,6 +39,13 @@ _BASE: dict[Kind, int] = {
     Kind.NEW_REGISTRY_CATEGORY: 3,
     Kind.NEW_MANIFEST_KEY: 3,
     Kind.REMOVED_JS_EXPORT: 3,
+    # A removed module is a rare, loud deprecation story. A new module
+    # starts at 2: [ADD] subject tag (+1) puts a deliberate addition at
+    # the surface threshold, the auto_install penalty (-1) sinks bridge
+    # glue, and intent keywords / adoption breadth promote the real
+    # platform stories (new report engine) toward the ledger.
+    Kind.REMOVED_MODULE: 3,
+    Kind.NEW_MODULE: 2,
     Kind.NEW_DECORATOR_OR_HELPER: 2,
     Kind.NEW_KWARG: 2,
     Kind.NEW_VIEW_DIRECTIVE: 2,
@@ -71,6 +78,8 @@ _KIND_PRIORITY: dict[Kind, int] = {
     Kind.NEW_REGISTRY_ENTRY: 18,
     Kind.DEPENDENCY_CHANGE: 19,
     Kind.NEW_MANIFEST_KEY: 20,
+    Kind.NEW_MODULE: 21,
+    Kind.REMOVED_MODULE: 22,
     Kind.ROLLOUT: 99,
 }
 
@@ -120,7 +129,12 @@ def score_event(record: ChangeRecord, ctx: ScoreContext) -> ChangeRecord:
         delta += 1
         reasons.append(f"key_dev_author:{ctx.commit.author_email}:+1")
 
-    if record.symbol:
+    # Module commits name their module in the subject by convention
+    # (`[ADD] paper_muncher: ...`), so the mention carries no signal
+    # for module kinds - every new module would get the bump.
+    if record.symbol and record.kind not in (
+        Kind.NEW_MODULE, Kind.REMOVED_MODULE,
+    ):
         short = record.symbol.rsplit(".", 1)[-1]
         blob = f"{ctx.commit.subject}\n{ctx.commit.body}"
         if short and short in blob:
@@ -135,6 +149,10 @@ def score_event(record: ChangeRecord, ctx: ScoreContext) -> ChangeRecord:
     if "/tests/" in record.file or record.file.startswith("tests/"):
         delta -= 1
         reasons.append("tests_path:-1")
+
+    if record.auto_install:
+        delta -= 1
+        reasons.append("auto_install_bridge:-1")
 
     raw = base + delta
     final = max(0, min(5, raw))

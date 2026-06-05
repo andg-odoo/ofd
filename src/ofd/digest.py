@@ -72,6 +72,15 @@ def build_sections(
                         change.removal_version or "-",
                         change.warning_text or "",
                     ))
+                elif change.kind == Kind.REMOVED_MODULE:
+                    # Module removals are rare and loud; surface them in
+                    # the deprecations section rather than losing them
+                    # (REMOVED_MODULE isn't a definition kind).
+                    deprecations.append((
+                        change.symbol or "?",
+                        change.removal_version or "-",
+                        change.signature or "",
+                    ))
 
     sections = DigestSections()
     for sym, (kind, subject) in sorted(new_by_symbol.items()):

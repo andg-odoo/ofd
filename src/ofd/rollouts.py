@@ -146,6 +146,12 @@ _KIND_LANGUAGES: dict[Kind, frozenset[Language]] = {
     Kind.NEW_FILE_CONVENTION:       frozenset(),
     Kind.NEW_MANIFEST_KEY:          frozenset(),
     Kind.DEPENDENCY_CHANGE:         frozenset(),
+    # Modules adopt via `depends` additions, emitted by the modules
+    # extractor itself; their snake_case names are ordinary words the
+    # content matcher must never scan for. REMOVED_MODULE isn't a
+    # definition kind; its row is inert symmetry.
+    Kind.NEW_MODULE:                frozenset(),
+    Kind.REMOVED_MODULE:            frozenset(),
     # JS primitives (DESIGN-js.md, phases 2+3). Exports adopt via
     # import lines in .js (`_js_import_pattern`) and via component
     # tags (`<BadgeTag`) in OWL templates - QWEB scope, phase 3.
