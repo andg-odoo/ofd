@@ -215,6 +215,13 @@ _GENERIC_SHORT_NAMES: frozenset[str] = frozenset({
     # Manifest.raw_value 149 (kanban `record.x.raw_value` template
     # expressions), FormatVatLabelMixin.fields_get 45.
     "unlink", "request", "raw_value", "fields_get",
+    # `Environment.website` (2026-06-05) collides with the `website`
+    # URL *field* on res.partner/res.company: `partner.website` is an
+    # attribute read the ast qualifier can't tell from `env.website`,
+    # and `<field name="website"/>` matches in VIEW scope. Its genuine
+    # breadth (274 rollouts on conversion day) is already persisted;
+    # import-only matching from here on just stops the FP drip.
+    "website",
     # Ubiquitous parameter names - NEW_KWARG sub-symbols like
     # `SomeMethod.ids` would else match every `.ids` / `ids=` in Odoo.
     "ids", "id", "query", "table", "kind", "it", "model", "record",
