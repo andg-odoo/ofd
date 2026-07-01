@@ -13,13 +13,20 @@ For each `<rng:define>`, we summarize:
 Diffing summaries between two file revisions yields:
 - `new_view_attribute` - attribute added to a define
 - `removed_view_attribute` - attribute removed from a define
-- `new_view_directive` - new `<rng:ref>` or `<rng:element>` inside a define
-  (expanded content model - e.g. filter can now contain filter/field)
+- `new_view_directive` - a child element/ref whose occurrence count rose
+  inside a define (expanded content model). This fires both when a child
+  is brand new AND when an existing child gains a NEW syntactic position -
+  e.g. `<field>` becoming allowable inside a `<filter>` group that
+  previously held only `<filter>` refs, even though `<field>` already
+  appeared in another `<filter>` branch. A flat set-diff misses the
+  latter (the tag is already in the ref set); counting occurrences per
+  scope is the group-restructure signal name-based diffing can't see.
 - `new_view_element` - a brand-new top-level define
 """
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
@@ -34,29 +41,16 @@ _NS = {"rng": _RNG_NS}
 @dataclass
 class _DefineSummary:
     attributes: set[str] = field(default_factory=set)
-    refs: set[str] = field(default_factory=set)
-    inline_elements: set[str] = field(default_factory=set)
-    # Structural fingerprints for rng:group / rng:choice subtrees so we
-    # can detect restructuring (new syntactic options) even when the
-    # attribute/ref sets don't change.
-    group_shapes: set[str] = field(default_factory=set)
+    # Count of each child element/ref tag reachable directly in this
+    # scope (not crossing nested `<rng:element>` boundaries). A COUNT,
+    # not a set: a tag gaining a NEW syntactic position - e.g. `<field>`
+    # becoming allowable inside one `<filter>` branch where it wasn't
+    # before, even though `<field>` already appears in another branch of
+    # the same `<filter>` - shows up as an increase. A flat set-diff
+    # misses that (the tag is already in the set); the count diff is the
+    # group-restructure signal name-based diffing can't see.
+    child_tags: Counter[str] = field(default_factory=Counter)
     line: int = 1
-
-    def added_vs(self, other: _DefineSummary) -> dict[str, set[str]]:
-        return {
-            "attributes": self.attributes - other.attributes,
-            "refs": self.refs - other.refs,
-            "inline_elements": self.inline_elements - other.inline_elements,
-            "group_shapes": self.group_shapes - other.group_shapes,
-        }
-
-    def removed_vs(self, other: _DefineSummary) -> dict[str, set[str]]:
-        return {
-            "attributes": other.attributes - self.attributes,
-            "refs": other.refs - self.refs,
-            "inline_elements": other.inline_elements - self.inline_elements,
-            "group_shapes": other.group_shapes - self.group_shapes,
-        }
 
 
 def _parse(source: str) -> etree._Element | None:
@@ -69,8 +63,8 @@ def _parse(source: str) -> etree._Element | None:
 def _iter_scope(scope_root: etree._Element):
     """Yield descendants of `scope_root` in document order, but stop
     descending whenever a child is a nested `<rng:element>` (still
-    yielding the element itself so its name is captured as an
-    inline_element in the parent's summary).
+    yielding the element itself so its name is counted as a child tag
+    in the parent's summary).
 
     This is the boundary that fixes attribute misattribution: an
     `<rng:attribute>` deep inside `<rng:element name="column">` belongs
@@ -86,8 +80,12 @@ def _iter_scope(scope_root: etree._Element):
 
 
 def _summarize_scope(scope_root: etree._Element) -> _DefineSummary:
-    """Direct attributes/refs/inline-elements visible at `scope_root`,
-    not crossing nested `<rng:element>` boundaries.
+    """Direct attributes and child tags (refs + inline elements) visible
+    at `scope_root`, not crossing nested `<rng:element>` boundaries.
+
+    Child tags are COUNTED, not just collected: a ref/element that gains
+    an extra occurrence (a new syntactic position inside a restructured
+    content model) is then detectable as a count increase.
     """
     summary = _DefineSummary(line=scope_root.sourceline or 1)
     for desc in _iter_scope(scope_root):
@@ -98,49 +96,11 @@ def _summarize_scope(scope_root: etree._Element) -> _DefineSummary:
             n = desc.get("name")
             if n:
                 summary.attributes.add(n)
-        elif tag == "ref":
+        elif tag in ("ref", "element"):
             n = desc.get("name")
             if n:
-                summary.refs.add(n)
-        elif tag == "element":
-            n = desc.get("name")
-            if n:
-                summary.inline_elements.add(n)
-        elif tag in ("group", "choice"):
-            summary.group_shapes.add(_group_fingerprint(desc, tag))
+                summary.child_tags[n] += 1
     return summary
-
-
-def _group_fingerprint(node: etree._Element, kind: str) -> str:
-    """Deterministic signature of a <rng:group> or <rng:choice>.
-
-    Represents the node as `kind(child_tag:value, ...)` sorted, so
-    permutations don't count as different and context (attribute /
-    ref / element names) is preserved.
-    """
-    parts: list[str] = []
-    for child in node:
-        # Skip comments / PIs: their .tag is a function, not a string.
-        if not isinstance(child.tag, str):
-            continue
-        tag = etree.QName(child).localname
-        if tag == "attribute":
-            parts.append(f"attr:{child.get('name') or ''}")
-        elif tag == "ref":
-            parts.append(f"ref:{child.get('name') or ''}")
-        elif tag == "element":
-            parts.append(f"el:{child.get('name') or ''}")
-        elif tag in {"group", "choice", "oneOrMore", "zeroOrMore", "optional"}:
-            nested = ",".join(
-                f"{etree.QName(gc).localname}:"
-                f"{gc.get('name') or etree.QName(gc).localname}"
-                for gc in child
-                if isinstance(gc.tag, str)
-            )
-            parts.append(f"{tag}({nested})")
-        else:
-            parts.append(tag)
-    return f"{kind}(" + ",".join(sorted(parts)) + ")"
 
 
 def _collect_summaries(
@@ -150,14 +110,14 @@ def _collect_summaries(
 
     - `top_level`: one entry per `<rng:define name="X">`, summarizing
       X's own scope (the canonical `<rng:element name="X">` wrapper if
-      present, else the define itself). Direct attributes/refs only -
-      attributes inside nested `<rng:element>` tags are NOT rolled up.
+      present, else the define itself). Direct attributes / child tags
+      only - anything inside nested `<rng:element>` tags is NOT rolled up.
     - `summaries`: a wider map keyed by every element name that appears
       either as a top-level define OR as a nested `<rng:element name="Y">`
       inside any define. Same per-scope semantics as `top_level`. Used
-      for attribute/ref diffs so a new `align` attribute on `column`
-      shows up as `column.align`, not `list.align` (the misattribution
-      that motivated this restructure).
+      for attribute / child-tag diffs so a new `align` attribute on
+      `column` shows up as `column.align`, not `list.align` (the
+      misattribution that motivated this restructure).
 
     Same-name collisions (an inline `<rng:element name="Y">` plus a
     top-level `<rng:define name="Y">`) union into one entry - both
@@ -172,9 +132,7 @@ def _collect_summaries(
             summaries[name] = summary
         else:
             existing.attributes |= summary.attributes
-            existing.refs |= summary.refs
-            existing.inline_elements |= summary.inline_elements
-            existing.group_shapes |= summary.group_shapes
+            existing.child_tags += summary.child_tags
 
     for define in root.iter(f"{{{_RNG_NS}}}define"):
         name = define.get("name")
@@ -277,10 +235,8 @@ def extract(
     for name in sorted(child_summaries.keys() & parent_summaries.keys()):
         after = child_summaries[name]
         before = parent_summaries[name]
-        added = after.added_vs(before)
-        removed = after.removed_vs(before)
 
-        for attr_name in sorted(added["attributes"]):
+        for attr_name in sorted(after.attributes - before.attributes):
             records.append(ChangeRecord(
                 kind=Kind.NEW_VIEW_ATTRIBUTE,
                 file=file,
@@ -290,7 +246,7 @@ def extract(
                 rng_file=file,
                 symbol=_module_symbol(file, f"{name}.{attr_name}"),
             ))
-        for attr_name in sorted(removed["attributes"]):
+        for attr_name in sorted(before.attributes - after.attributes):
             records.append(ChangeRecord(
                 kind=Kind.REMOVED_VIEW_ATTRIBUTE,
                 file=file,
@@ -300,28 +256,25 @@ def extract(
                 rng_file=file,
                 symbol=_module_symbol(file, f"{name}.{attr_name}"),
             ))
-        # New refs or inline elements = expanded content model. Emit as
-        # `new_view_directive` so ledger routing treats these separately
-        # from attribute additions.
-        for ref_name in sorted(added["refs"] | added["inline_elements"]):
-            records.append(ChangeRecord(
-                kind=Kind.NEW_VIEW_DIRECTIVE,
-                file=file,
-                line=after.line,
-                element=name,
-                directive=ref_name,
-                rng_file=file,
-                symbol=_module_symbol(file, f"{name}+{ref_name}"),
-            ))
-
-        # Net-new <rng:group>/<rng:choice> shapes (restructured content
-        # model with no new attributes/refs/elements) are intentionally
-        # NOT emitted: their directive value is a structural fingerprint
-        # (`group(attr:foo,ref:bar)`), not a tag name, so the rollout
-        # matcher has no shape to match against and the entry sits at
-        # zero rollouts forever. The `group_shapes` summary still
-        # exists - it's used to compare content models within elements
-        # that DO gain other things - we just don't promote it to its
-        # own primitive.
+        # New or repositioned child tags = expanded content model. A tag
+        # whose occurrence count rose either appeared for the first time
+        # (brand-new ref / inline element) or gained a new syntactic
+        # position (e.g. `<field>` newly allowed inside a `<filter>`
+        # group that previously held only `<filter>` refs). Both mean
+        # "element X may now contain Y here" - emit as `new_view_directive`
+        # so ledger routing treats these separately from attribute adds.
+        # A pure restructure that only rewraps existing content leaves
+        # every count unchanged, so it emits nothing.
+        for child_tag in sorted(after.child_tags):
+            if after.child_tags[child_tag] > before.child_tags[child_tag]:
+                records.append(ChangeRecord(
+                    kind=Kind.NEW_VIEW_DIRECTIVE,
+                    file=file,
+                    line=after.line,
+                    element=name,
+                    directive=child_tag,
+                    rng_file=file,
+                    symbol=_module_symbol(file, f"{name}+{child_tag}"),
+                ))
 
     return records

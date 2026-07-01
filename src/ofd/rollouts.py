@@ -54,7 +54,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from functools import lru_cache
 
@@ -280,10 +280,12 @@ def _directive_pattern(name: str) -> re.Pattern[str]:
     attribute on `<X>`, which is the wrong shape and fired ~never.
 
     Now we look for the child opening tag directly. The language gate
-    already restricts scanning to `.xml` / `.rng` so the FP surface is
-    narrow; if a directive's tag name collides with an unrelated
-    element used in other XML contexts (e.g. reports), the future
-    `required_ancestor` annotation can tighten this further.
+    already restricts scanning to `.xml` / `.rng`, and
+    `_directive_parent_present` then confirms the matched child tag
+    actually nests inside its parent element - so a common child like
+    `<field>` (which appears in every view) only counts as a
+    `filter+field` adoption when it sits inside a `<filter>`, not as
+    stray markup elsewhere in the diff.
     """
     n = re.escape(name)
     return re.compile(rf"<{n}\b")
@@ -490,6 +492,11 @@ class _Hunk:
     raw_added: list[str]   # lines starting with "+"
     raw_removed: list[str] # lines starting with "-"
     line_in_child: int     # starting line number in the new file
+    # New-file line numbers of the "+" lines. Lets the directive matcher
+    # tie an added `<field>` to its own position in the parsed child tree
+    # (via `sourceline`), so a field added *elsewhere* in a view that
+    # merely already contains a field-in-filter doesn't count.
+    added_linenos: set[int] = field(default_factory=set)
 
 
 def _parse_patch(patch: str) -> list[_Hunk]:
@@ -497,6 +504,7 @@ def _parse_patch(patch: str) -> list[_Hunk]:
     out: list[_Hunk] = []
     current_file: str | None = None
     hunk: _Hunk | None = None
+    new_lineno = 0
 
     for raw_line in patch.splitlines():
         if raw_line.startswith("+++ "):
@@ -522,20 +530,25 @@ def _parse_patch(patch: str) -> list[_Hunk]:
                 raw_removed=[],
                 line_in_child=line_in_child,
             )
+            new_lineno = line_in_child
             continue
         if hunk is None:
             continue
         if raw_line.startswith("+") and not raw_line.startswith("+++"):
             hunk.after.append(raw_line[1:])
             hunk.raw_added.append(raw_line[1:])
+            hunk.added_linenos.add(new_lineno)
+            new_lineno += 1
         elif raw_line.startswith("-") and not raw_line.startswith("---"):
             hunk.before.append(raw_line[1:])
             hunk.raw_removed.append(raw_line[1:])
+            # Removed lines don't exist in the new file: don't advance.
         else:
-            # context line
+            # context line: present in the new file, so advance.
             body = raw_line[1:] if raw_line.startswith(" ") else raw_line
             hunk.before.append(body)
             hunk.after.append(body)
+            new_lineno += 1
 
     if hunk:
         out.append(hunk)
@@ -924,6 +937,124 @@ def _ast_qualifies(root, kind: Kind, name: str) -> bool:
     return _has_truncated_identifier(root, name)
 
 
+# Runtime-equivalent view roots: modern `<list>` and deprecated `<tree>`
+# are the same view type, so a directive whose RNG define is `list` must
+# count adoptions nested under either tag.
+_VIEW_TAG_ALIASES: dict[str, frozenset[str]] = {
+    "list": frozenset({"list", "tree"}),
+    "tree": frozenset({"list", "tree"}),
+}
+
+
+# XPath `position` values that insert the added children INSIDE the
+# matched target (so every step of the expr is an ancestor of the new
+# child). `replace`/`after`/`before` instead place the children where the
+# target sits (only the steps ABOVE the target are ancestors); `move` /
+# `attributes` don't introduce a nesting we can attribute.
+_XPATH_INSIDE_POSITIONS = frozenset({None, "", "inside"})
+_XPATH_RELATIVE_POSITIONS = frozenset({"replace", "after", "before"})
+
+
+@lru_cache(maxsize=512)
+def _xpath_steps(expr: str) -> tuple[str, ...]:
+    """Element-name steps of an XPath `expr`, in order.
+    `//list[@name='x']//field[@name='y']` -> ('list', 'field'). Predicates,
+    axes, attribute tests and wildcards contribute no element name.
+    """
+    steps: list[str] = []
+    for part in expr.split("/"):
+        part = part.strip()
+        if not part or part in (".", "..") or part.startswith("@"):
+            continue
+        m = re.match(r"[A-Za-z_][\w.-]*", part)
+        if m:
+            steps.append(m.group(0))
+    return tuple(steps)
+
+
+def _xpath_targets_parent(
+    expr: str, position: str | None, allowed: frozenset[str],
+) -> bool:
+    """Does `<xpath expr position>` insert its children inside one of
+    `allowed`?
+
+    - `inside` (or default): children go inside the target, so every step
+      of the expr is an ancestor of the insertion point.
+    - `replace` / `after` / `before`: children take the target's place or
+      sit beside it, so only the steps ABOVE the target (all but the last)
+      are ancestors - this is what stops `<xpath expr="//filter[...]"
+      position="after"><filter/></xpath>` (a sibling filter) from counting
+      as a nested `filter+filter`.
+    - anything else (`move`, `attributes`): no attributable nesting.
+    """
+    steps = _xpath_steps(expr)
+    if not steps:
+        return False
+    if position in _XPATH_INSIDE_POSITIONS:
+        candidate = steps
+    elif position in _XPATH_RELATIVE_POSITIONS:
+        candidate = steps[:-1]
+    else:
+        return False
+    return any(s in allowed for s in candidate)
+
+
+def _child_added_under_parent(
+    xml_root: etree._Element | None,
+    entry: WatchlistEntry,
+    added_linenos: set[int],
+) -> bool:
+    """Confirm the directive's child tag was ADDED nested inside its
+    parent element in this hunk.
+
+    A directive `element+childtag` means "<element> may now contain
+    <childtag>"; its adoption is a `<childtag>` opening tag. Three failure
+    modes a bare `<childtag\\b` regex can't handle:
+
+    - Over-count: `<field>` appears in essentially every view, so
+      `filter+field` would match every field. We restrict to `<childtag>`
+      elements whose `sourceline` is one of this hunk's added lines
+      (element precision - a field added *elsewhere* in a view that merely
+      already contains a field-in-filter doesn't count).
+    - Inheritance via xpath: an adopter often adds the child through
+      `<xpath expr="//list[...]" position="replace"><column/></xpath>`,
+      where the literal ancestor is `<xpath>`, not `<list>`. We resolve
+      the expr + position to the effective container (`_xpath_targets_parent`).
+    - Inheritance directives that DON'T nest: a matched
+      `<filter name="x" position="after"><filter/></filter>` inserts a
+      SIBLING, not a child - so a `<parent>`-tagged ancestor only counts
+      when its `position` keeps the child inside it (default / `inside`).
+
+    Rejects conservatively when the child source can't be parsed - the
+    structure can't be confirmed, so don't emit (mirrors
+    `_ancestor_qualifies`).
+    """
+    parent = entry.element
+    if not parent:
+        return True  # no parent recorded: fall back to the regex hit
+    if xml_root is None:
+        return False
+    allowed = _VIEW_TAG_ALIASES.get(parent, frozenset({parent}))
+    for el in xml_root.iter(entry.short_name):
+        if el.sourceline not in added_linenos:
+            continue
+        for anc in el.iterancestors():
+            if not isinstance(anc.tag, str):
+                continue
+            anc_tag = etree.QName(anc).localname
+            pos = anc.get("position")
+            # A real container: a `<parent>` element whose children stay
+            # inside it (a primary-view element has no `position`; an
+            # inherited one must be `inside`/default, not after/before).
+            if anc_tag in allowed and pos in _XPATH_INSIDE_POSITIONS:
+                return True
+            if anc_tag == "xpath" and _xpath_targets_parent(
+                anc.get("expr") or "", pos, allowed,
+            ):
+                return True
+    return False
+
+
 def _ancestor_qualifies(
     xml_root: etree._Element | None,
     entry: WatchlistEntry,
@@ -1171,14 +1302,20 @@ def detect_rollouts(
     # for files where an entry actually requires the structural check.
     parsed_xml: dict[str, etree._Element | None] = {}
 
+    def _src_for(file: str) -> str | None:
+        """Child source for `file`, fetched at most once. Feeds both the
+        cheap substring gate and (on demand) the lxml parse."""
+        if child_sources is not None and file in child_sources:
+            return child_sources[file]
+        src = fetch_child(file) if fetch_child is not None else None
+        if child_sources is not None:
+            child_sources[file] = src
+        return src
+
     def _xml_root_for(file: str) -> etree._Element | None:
         if file in parsed_xml:
             return parsed_xml[file]
-        src = (child_sources or {}).get(file)
-        if src is None and fetch_child is not None:
-            src = fetch_child(file)
-            if child_sources is not None and src is not None:
-                child_sources[file] = src
+        src = _src_for(file)
         if not src:
             parsed_xml[file] = None
             return None
@@ -1187,6 +1324,32 @@ def detect_rollouts(
         except etree.XMLSyntaxError:
             parsed_xml[file] = None
         return parsed_xml[file]
+
+    def _directive_qualifies(file: str, entry, hunk: _Hunk) -> bool:
+        """Structural check for a NEW_VIEW_DIRECTIVE rollout, with a cheap
+        pre-gate. `<field>` (the `filter+field` short name) appears in
+        nearly every view, so the `<field\\b` regex fires constantly; a
+        full lxml parse on each hit would dominate the rollout stage.
+        First a substring scan (~100x cheaper than a parse) rejects a
+        view that has neither the parent tag nor any `<xpath>` - it can't
+        be an adoption, direct or inherited. Only then parse and confirm
+        the child was ADDED nested under the parent (see
+        `_child_added_under_parent`)."""
+        parent = entry.element
+        if not parent:
+            return True
+        src = _src_for(file)
+        if not src:
+            return False
+        allowed = _VIEW_TAG_ALIASES.get(parent, frozenset({parent}))
+        # A direct adoption has a literal `<parent>`; an inherited one
+        # reaches the parent through an `<xpath expr="//parent...">`.
+        # Neither present -> can't qualify, skip the parse.
+        if not any(f"<{tag}" in src for tag in allowed) and "<xpath" not in src:
+            return False
+        return _child_added_under_parent(
+            _xml_root_for(file), entry, hunk.added_linenos,
+        )
 
     # Shared-name primitives (e.g. a new kwarg `compute_sql` added to
     # 10 Field subclasses) dedupe to one rollout per hunk, attributed
@@ -1300,9 +1463,17 @@ def detect_rollouts(
                                 ast_root = SgRoot(added_blob, "python").root()
                             if not _ast_qualifies(ast_root, entry.kind, entry.short_name):
                                 continue
-                        if entry.required_ancestor:
-                            if not _ancestor_qualifies(_xml_root_for(file), entry):
-                                continue
+                        # A directive is "<element> contains <childtag>":
+                        # require the child to actually nest in its parent
+                        # element, else a bare `<field>` anywhere counts.
+                        if entry.kind is Kind.NEW_VIEW_DIRECTIVE and (
+                            not _directive_qualifies(file, entry, hunk)
+                        ):
+                            continue
+                        if entry.required_ancestor and (
+                            not _ancestor_qualifies(_xml_root_for(file), entry)
+                        ):
+                            continue
                         records.append(_make_record(file, hunk, entry))
                 elif is_js:
                     # Per-entry matching: two JS exports can share a
@@ -1346,9 +1517,10 @@ def detect_rollouts(
                             ast_root = SgRoot(added_blob, "python").root()
                         if not _ast_qualifies(ast_root, first.kind, first.short_name):
                             continue
-                    if first.required_ancestor:
-                        if not _ancestor_qualifies(_xml_root_for(file), first):
-                            continue
+                    if first.required_ancestor and (
+                        not _ancestor_qualifies(_xml_root_for(file), first)
+                    ):
+                        continue
                     records.append(_make_record(file, hunk, first))
     return records
 

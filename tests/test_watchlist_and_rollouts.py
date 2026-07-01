@@ -631,36 +631,233 @@ def test_unknown_extension_skipped():
     assert detect_rollouts({"m.po": po_patch, "s.scss": scss_patch}, wl, {}) == []
 
 
-def test_directive_rollout_matches_child_opening_tag():
-    """NEW_VIEW_DIRECTIVE rollouts (e.g. `list+column`) must match the
-    child element's opening tag in XML diffs, not look for it as an
-    attribute on the parent. Pre-fix, the matcher compiled an
-    attribute-shaped regex that essentially never fired."""
+def _directive_watchlist(element: str, directive: str) -> Watchlist:
     wl = Watchlist()
     wl.add_from_definition(
         ChangeRecord(
             kind=Kind.NEW_VIEW_DIRECTIVE,
             file="odoo/addons/base/rng/list_view.rng",
             line=1,
-            element="list",
-            directive="column",
-            symbol="odoo.addons.base.rng.list_view.list+column",
+            element=element,
+            directive=directive,
+            symbol=f"odoo.addons.base.rng.list_view.{element}+{directive}",
         ),
         repo="odoo", sha="abc", committed_at="2026-04-09T00:00:00Z",
         active_version="20.0",
     )
+    return wl
+
+
+def _dir_patch(child_src: str, added: set[int]) -> tuple[dict, dict]:
+    """Build a single-hunk patch + child_sources for `child_src` (the full
+    new file). `added` is the set of 1-based line numbers marked '+' (the
+    rest are context). Line N of `child_src` == new-file line N == lxml
+    `sourceline` N, so the matcher's element precision (`sourceline in
+    added_linenos`) is exercised faithfully."""
+    lines = child_src.split("\n")
+    body = "\n".join(
+        ("+" if i in added else " ") + ln for i, ln in enumerate(lines, 1)
+    )
+    patch = f"--- a/v.xml\n+++ b/v.xml\n@@ -1,1 +1,{len(lines)} @@\n{body}\n"
+    return {"v.xml": patch}, {"v.xml": child_src}
+
+
+def test_directive_rollout_matches_child_added_in_parent():
+    """NEW_VIEW_DIRECTIVE rollouts (e.g. `list+column`) match the child
+    element's opening tag when it's ADDED nested inside its parent."""
+    wl = _directive_watchlist("list", "column")
+    src = (
+        "<list>\n"
+        '    <column string="Total">\n'
+        '        <field name="amount"/>\n'
+        "    </column>\n"
+        "</list>"
+    )
+    patches, srcs = _dir_patch(src, added={2, 3, 4})
+    records = detect_rollouts(patches, wl, srcs)
+    assert len(records) == 1
+    assert records[0].symbol == "odoo.addons.base.rng.list_view.list+column"
+
+
+def test_directive_rollout_requires_child_added_inside_parent():
+    """A directive means `<element>` may contain `<childtag>`; a `<field>`
+    ADDED inside a `<filter>` counts."""
+    wl = _directive_watchlist("filter", "field")
+    src = (
+        "<search>\n"
+        '    <filter name="stage" string="Stage">\n'
+        '        <field name="stage_id"/>\n'
+        "    </filter>\n"
+        "</search>"
+    )
+    patches, srcs = _dir_patch(src, added={2, 3, 4})
+    hits = detect_rollouts(patches, wl, srcs)
+    assert len(hits) == 1
+    assert hits[0].symbol == "odoo.addons.base.rng.list_view.filter+field"
+
+
+def test_directive_rollout_ignores_field_added_outside_filter():
+    """The false-positive class: a search view that ALREADY contains a
+    field-in-filter, where the commit adds a `<field>` somewhere else (a
+    top-level search field). Only the ADDED field's position matters, so
+    the pre-existing field-in-filter must not make this count."""
+    wl = _directive_watchlist("filter", "field")
+    src = (
+        "<search>\n"                                    # 1
+        '    <filter name="stage" string="Stage">\n'    # 2 pre-existing
+        '        <field name="stage_id"/>\n'            # 3 pre-existing
+        "    </filter>\n"                               # 4
+        '    <field name="partner_id"/>\n'              # 5 ADDED, outside filter
+        "</search>"                                     # 6
+    )
+    patches, srcs = _dir_patch(src, added={5})
+    assert detect_rollouts(patches, wl, srcs) == []
+
+
+def test_directive_rollout_matches_xpath_inherited_child():
+    """An inheriting view adds `<column>` via
+    `<xpath expr="//list[...]" position="replace">`; the literal ancestor
+    is `<xpath>`, not `<list>`, but the expr targets a `list` step, so it
+    still counts (the pos_sale stacked-column case)."""
+    wl = _directive_watchlist("list", "column")
+    src = (
+        "<record>\n"                                                          # 1
+        '  <field name="arch" type="xml">\n'                                  # 2
+        "    <xpath expr=\"//list[@name='ol']//field[@name='p']\" position=\"replace\">\n"  # 3
+        "      <column>\n"                                                    # 4
+        '        <field name="p"/>\n'                                          # 5
+        "      </column>\n"                                                   # 6
+        "    </xpath>\n"                                                      # 7
+        "  </field>\n"                                                        # 8
+        "</record>"                                                          # 9
+    )
+    patches, srcs = _dir_patch(src, added={4, 5, 6})
+    assert len(detect_rollouts(patches, wl, srcs)) == 1
+
+
+def test_directive_rollout_xpath_attr_value_is_not_a_target():
+    """An xpath mentioning the parent tag only inside an attribute value
+    (`//field[@name='filter_x']`) is not targeting a `<filter>`; the
+    added field must not count."""
+    wl = _directive_watchlist("filter", "field")
+    src = (
+        "<record>\n"                                                     # 1
+        '  <field name="arch" type="xml">\n'                             # 2
+        "    <xpath expr=\"//field[@name='filter_x']\" position=\"after\">\n"  # 3
+        '      <field name="y"/>\n'                                       # 4
+        "    </xpath>\n"                                                 # 5
+        "  </field>\n"                                                   # 6
+        "</record>"                                                     # 7
+    )
+    patches, srcs = _dir_patch(src, added={4})
+    assert detect_rollouts(patches, wl, srcs) == []
+
+
+def test_directive_rollout_filter_in_filter_only_when_nested():
+    """filter+filter counts a `<filter>` ADDED inside another `<filter>`
+    (inner filter), not a top-level `<filter>` added to a search view."""
+    wl = _directive_watchlist("filter", "filter")
+    nested = (
+        "<search>\n"                                    # 1
+        '    <filter name="outer" string="Outer">\n'    # 2 pre-existing
+        '        <filter name="inner" domain="[]"/>\n'  # 3 ADDED, nested
+        "    </filter>\n"                               # 4
+        "</search>"                                     # 5
+    )
+    p, s = _dir_patch(nested, added={3})
+    assert len(detect_rollouts(p, wl, s)) == 1
+
+    toplevel = (
+        "<search>\n"                                # 1
+        '    <filter name="a" domain="[]"/>\n'      # 2 ADDED, top-level
+        "</search>"                                 # 3
+    )
+    p2, s2 = _dir_patch(toplevel, added={2})
+    assert detect_rollouts(p2, wl, s2) == []
+
+
+def test_directive_rollout_xpath_after_is_sibling_not_nested():
+    """`<xpath expr="//filter[@name='x']" position="after"><filter/></xpath>`
+    inserts a SIBLING filter next to filter x, not a nested one - it must
+    not count as filter+filter (the residual xpath FP class)."""
+    wl = _directive_watchlist("filter", "filter")
+    src = (
+        "<record>\n"                                               # 1
+        '  <field name="arch" type="xml">\n'                       # 2
+        "    <xpath expr=\"//filter[@name='x']\" position=\"after\">\n"  # 3
+        '      <filter name="sibling" domain="[]"/>\n'              # 4
+        "    </xpath>\n"                                           # 5
+        "  </field>\n"                                             # 6
+        "</record>"                                               # 7
+    )
+    p, s = _dir_patch(src, added={4})
+    assert detect_rollouts(p, wl, s) == []
+
+
+def test_directive_rollout_xpath_inside_filter_is_nested():
+    """`<xpath expr="//filter[@name='x']" position="inside"><filter/></xpath>`
+    DOES nest the new filter inside filter x - counts as filter+filter."""
+    wl = _directive_watchlist("filter", "filter")
+    src = (
+        "<record>\n"                                                # 1
+        '  <field name="arch" type="xml">\n'                        # 2
+        "    <xpath expr=\"//filter[@name='x']\" position=\"inside\">\n"  # 3
+        '      <filter name="inner" domain="[]"/>\n'                 # 4
+        "    </xpath>\n"                                            # 5
+        "  </field>\n"                                              # 6
+        "</record>"                                                # 7
+    )
+    p, s = _dir_patch(src, added={4})
+    assert len(detect_rollouts(p, wl, s)) == 1
+
+
+def test_directive_rollout_matched_element_after_is_sibling():
+    """Element-match inheritance: `<filter name="x" position="after">
+    <filter/></filter>` inserts a sibling after filter x, not a child -
+    a `<filter>` ancestor whose position is after/before/replace is not a
+    real container, so this must not count."""
+    wl = _directive_watchlist("filter", "filter")
+    src = (
+        "<record>\n"                                    # 1
+        '  <field name="arch" type="xml">\n'            # 2
+        '    <filter name="x" position="after">\n'      # 3
+        '      <filter name="sibling" domain="[]"/>\n'   # 4
+        "    </filter>\n"                               # 5
+        "  </field>\n"                                  # 6
+        "</record>"                                    # 7
+    )
+    p, s = _dir_patch(src, added={4})
+    assert detect_rollouts(p, wl, s) == []
+
+
+def test_directive_rollout_list_alias_tree():
+    """A `list+column` adoption nested under the deprecated `<tree>`
+    alias still counts - list and tree are the same view type."""
+    wl = _directive_watchlist("list", "column")
+    src = (
+        "<tree>\n"
+        '    <column string="Total">\n'
+        '        <field name="amount"/>\n'
+        "    </column>\n"
+        "</tree>"
+    )
+    p, s = _dir_patch(src, added={2, 3, 4})
+    assert len(detect_rollouts(p, wl, s)) == 1
+
+
+def test_directive_rollout_rejects_when_child_source_unavailable():
+    """No child source and no fetcher means the structural nesting can't
+    be confirmed - reject conservatively rather than fall back to the
+    over-counting bare-regex behavior."""
+    wl = _directive_watchlist("filter", "field")
     patch = """\
 --- a/v.xml
 +++ b/v.xml
-@@ -1,1 +1,4 @@
- <list>
-+    <column string="Total">
-+        <field name="amount"/>
-+    </column>
+@@ -1,1 +1,2 @@
+ <search>
++    <filter name="x"><field name="y"/></filter>
 """
-    records = detect_rollouts({"v.xml": patch}, wl, {})
-    assert len(records) == 1
-    assert records[0].symbol == "odoo.addons.base.rng.list_view.list+column"
+    assert detect_rollouts({"v.xml": patch}, wl, {}) == []
 
 
 def test_directive_rollout_does_not_match_attribute_shape():

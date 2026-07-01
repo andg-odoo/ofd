@@ -105,6 +105,69 @@ def test_pr257101_filter_values_adds_field_ref():
     ), f"expected filter-can-contain-field; got {records}"
 
 
+def test_field_gains_new_position_when_already_present_elsewhere():
+    """The real PR 257101 shape (commit 219d4220d3e3): `<field>` already
+    appears in the standard-filter branch, and the change adds it to the
+    parent-filter branch too. A flat ref-set diff sees no new ref (field
+    is already in the scope's ref set) and misses the feature entirely.
+    Counting occurrences per scope catches it: field goes 1 -> 2."""
+    parent = _wrap("""
+    <rng:define name="filter">
+        <rng:element name="filter">
+            <rng:choice>
+                <rng:group>
+                    <rng:attribute name="name"/>
+                    <rng:zeroOrMore>
+                        <rng:choice>
+                            <rng:ref name="field"/>
+                            <rng:ref name="filter"/>
+                        </rng:choice>
+                    </rng:zeroOrMore>
+                </rng:group>
+                <rng:group>
+                    <rng:attribute name="string"/>
+                    <rng:oneOrMore>
+                        <rng:ref name="filter"/>
+                    </rng:oneOrMore>
+                </rng:group>
+            </rng:choice>
+        </rng:element>
+    </rng:define>
+    """)
+    child = _wrap("""
+    <rng:define name="filter">
+        <rng:element name="filter">
+            <rng:choice>
+                <rng:group>
+                    <rng:attribute name="name"/>
+                    <rng:zeroOrMore>
+                        <rng:choice>
+                            <rng:ref name="field"/>
+                            <rng:ref name="filter"/>
+                        </rng:choice>
+                    </rng:zeroOrMore>
+                </rng:group>
+                <rng:group>
+                    <rng:attribute name="string"/>
+                    <rng:choice>
+                        <rng:ref name="field"/>
+                        <rng:oneOrMore>
+                            <rng:ref name="filter"/>
+                        </rng:oneOrMore>
+                    </rng:choice>
+                </rng:group>
+            </rng:choice>
+        </rng:element>
+    </rng:define>
+    """)
+    records = extract(parent, child, "odoo/addons/base/rng/common.rng")
+    directives = [r for r in records if r.kind == Kind.NEW_VIEW_DIRECTIVE]
+    assert [(r.element, r.directive) for r in directives] == [("filter", "field")], (
+        f"expected exactly filter+field; got {[(r.element, r.directive) for r in directives]}"
+    )
+    assert directives[0].symbol == "odoo.addons.base.rng.common.filter+field"
+
+
 def test_new_attribute_on_element():
     parent = _wrap("""
     <rng:define name="label">

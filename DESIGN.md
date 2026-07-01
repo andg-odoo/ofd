@@ -126,19 +126,47 @@ change-record schema.
 ### 5.2 XML / RNG (`extractors/xml_.py`, `extractors/rng.py`)
 
 - Uses `lxml.etree`.
-- RNG: for each `<rng:define>`, compute a summary of
-  (attributes, refs, inline elements, group/choice shapes) and diff.
+- RNG: for each `<rng:define>`, compute a summary of (attributes, and a
+  per-scope *count* of each child ref/inline-element tag) and diff.
   Catches:
   - `new_view_attribute` / `removed_view_attribute` - attribute added or
     removed in an element definition.
   - `new_view_element` - a brand-new top-level define.
-  - `new_view_directive` - new child ref, inline element, or net-new
-    `<rng:group>` / `<rng:choice>` shape. The group-shape path catches
-    pure restructuring (e.g. PR 241459 reorganizing `<filter>` into
-    choice-of-groups without changing its attribute set).
-- Validated against PR 241459 (subfilter) and PR 257101 (filter `<field>`
-  child) from master: both produce `new_view_directive` events on the
-  `filter` define.
+  - `new_view_directive` - a child tag whose occurrence count in the
+    scope rose. Fires both for a brand-new child (0 -> N) AND for an
+    existing child that gains a NEW syntactic position (M -> M+k). The
+    latter is the group-restructure case a flat ref-set diff misses: PR
+    257101 embeds `<field>` in a second `<filter>` branch where `<field>`
+    was already allowed in the first branch, so the ref set is unchanged
+    but `field`'s count goes 1 -> 2. A pure rewrap (same content moved
+    into a `<choice>`/`<group>`) leaves every count unchanged and emits
+    nothing.
+- Validated against PR 241459 (subfilter -> `filter+filter`), PR 257101
+  (filter `<field>` child -> `filter+field`), and PR 260940 (stacked
+  `<column>` -> `list+column`) from master.
+- Adoption of a `new_view_directive` is matched *structurally*, not by a
+  bare `<childtag>` regex (`rollouts._child_added_under_parent`). Three
+  properties make the count honest for a common child like `<field>`:
+  - **Element precision.** Only a `<childtag>` whose `sourceline` is one
+    of the hunk's ADDED lines counts - a field added elsewhere in a view
+    that merely already contains a field-in-filter doesn't (the raw diff
+    tracks added line numbers per hunk).
+  - **Inheritance via xpath.** An adopter often adds the child through
+    `<xpath expr="//list[...]" position="replace"><column/></xpath>`; the
+    expr + `position` are resolved to the effective container.
+  - **Position semantics.** `<filter position="after">` / xpath
+    `position="after"/"before"/"replace"` insert a SIBLING or replacement,
+    not a nested child - so a `<parent>` ancestor only counts when its
+    position keeps the child inside it (default / `inside`). This is what
+    separates a real `<filter><field/></filter>` from a field inserted
+    beside a filter.
+  Distinctive children (`<column>`) are effectively unaffected; `<list>`
+  and `<tree>` are treated as the same view root. Note the practical
+  finding: `filter+field`'s honest count is ~0 because the *syntax*
+  predates the RNG formalization (the schema caught up to a pattern devs
+  already used; the new behavior is JS-side and invisible here). These
+  directives are extension points valued by kind tier, not by an internal
+  adoption count.
 - XML (framework view fixtures): diff `<record>` elements with
   `type="<view_type>"` attributes. (Deferred.)
 
