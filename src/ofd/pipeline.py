@@ -33,6 +33,8 @@ from ofd.extractors import (
     js_,
     manifest_keys,
     modules,
+    owl_migration,
+    retired_deps,
 )
 from ofd.extractors.dispatcher import extract_for_file
 from ofd.globs import match_any
@@ -375,6 +377,23 @@ def process_commit(
             _fetch(f"{sha}^", "requirements.txt"),
             _fetch(sha, "requirements.txt"),
             "requirements.txt",
+        ))
+
+    # --- stage 1.9: framework epochs invisible to the primitive extractors ---
+    # Two loud framework stories leave no new symbol to define or adopt, so
+    # a dedicated subject-gated pass emits their rollouts explicitly (the
+    # extractor-emitted-rollout pattern; the content matcher is never
+    # involved and must never carry these tokens):
+    #   - OWL 2 -> 3 migration: one @odoo/owl rollout per migration commit,
+    #     turning the vendored-lib bump from 0 rollouts into real breadth.
+    #   - retirement of a pervasive front-end dependency (jQuery): a removed
+    #     DEPENDENCY_CHANGE epoch plus a per-commit breadth rollout.
+    changes.extend(owl_migration.extract(envelope.subject, all_files))
+    if retired_deps.mentions_retired_dep(envelope.subject):
+        if all_patches is None:
+            all_patches = gitio.commit_diff_by_file(repo.mirror, sha)
+        changes.extend(retired_deps.extract(
+            envelope.subject, all_patches, watchlist.entries,
         ))
 
     # Collapse same-commit override duplicates before they reach the

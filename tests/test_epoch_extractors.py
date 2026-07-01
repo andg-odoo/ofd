@@ -1,0 +1,117 @@
+"""OWL3-migration and retired-frontend-dependency epoch extractors.
+
+Both close a recall gap: a framework story that leaves no new symbol for
+the primitive extractors to define or adopt (an API swap, a dependency
+removal), so they emit rollouts explicitly from the commit subject + diff.
+"""
+
+from ofd.events.record import Kind
+from ofd.extractors import owl_migration, retired_deps
+
+# --- OWL 3 migration --------------------------------------------------------
+
+
+def test_owl3_migration_subjects_attribute_one_owl_rollout():
+    for subject in (
+        "[REF] web: Replace useLayoutEffect",
+        "[REF] *: Owl3 - replace useState with proxy",
+        "[REF] mail: replace onWillUpdateProps with owl3 alternatives",
+        "[REF] account: replace t-custom-model with t-model/t-model.proxy",
+        "[IMP] mail: use new props syntax OWL 3 (part 2)",
+        "[REF] mail: replace useExternalListener by useListener",
+        "[REF] *: Owl3 - replace one-arg reactive calls with proxy",
+    ):
+        records = owl_migration.extract(subject, ["addons/web/static/src/x.js"])
+        assert len(records) == 1, subject
+        r = records[0]
+        assert r.kind is Kind.ROLLOUT
+        assert r.symbol == "@odoo/owl"
+        assert r.symbol_hint == "owl3-migration"
+
+
+def test_owl3_migration_needs_frontend_files():
+    # Subject matches but the commit only touches Python/docs: not an adoption.
+    assert owl_migration.extract(
+        "[REF] web: Replace useLayoutEffect", ["odoo/models/foo.py", "README.md"],
+    ) == []
+
+
+def test_owl3_migration_skips_the_lib_bump_commit():
+    # The commit bumping owl.js is the VENDORED_LIB_BUMP definition; it must
+    # not also count as a migration rollout of itself.
+    assert owl_migration.extract(
+        "[REF] web: update owl library to owl3",
+        ["addons/web/static/lib/owl/owl.js"],
+    ) == []
+
+
+def test_owl3_migration_ignores_unrelated_subjects():
+    for subject in (
+        "[FIX] web: useEffect cleanup fires twice",   # useEffect != useLayoutEffect
+        "[IMP] mail: make the reactive store faster",  # reactive without proxy
+        "[FIX] account: fix proxy settings parsing",   # proxy without owl term
+        "[ADD] web: new dashboard view",
+    ):
+        assert owl_migration.extract(
+            subject, ["addons/web/static/src/x.js"],
+        ) == [], subject
+
+
+# --- retired front-end dependency (jQuery) ----------------------------------
+
+_JQUERY_REMOVAL_PATCH = {
+    "addons/web/static/src/legacy/utils.js": (
+        "--- a/addons/web/static/src/legacy/utils.js\n"
+        "+++ b/addons/web/static/src/legacy/utils.js\n"
+        "@@ -1,3 +1,2 @@\n"
+        '-import jQuery from "jquery";\n'
+        "-    jQuery(el).hide();\n"
+        "     el.classList.add('d-none');\n"
+    ),
+}
+
+
+def test_jquery_retirement_emits_definition_then_rollout():
+    # First commit: no prior watchlist entry -> definition epoch + rollout.
+    records = retired_deps.extract(
+        "[REM] web: remove jQuery from codebase", _JQUERY_REMOVAL_PATCH, {},
+    )
+    kinds = [(r.kind, r.symbol, r.symbol_hint) for r in records]
+    assert (Kind.DEPENDENCY_CHANGE, "frontend.jquery", "removed") in kinds
+    assert (Kind.ROLLOUT, "frontend.jquery", "removed") in kinds
+
+    # Follow-up commit, symbol already watchlisted -> rollout only (breadth).
+    followup = retired_deps.extract(
+        "[REM] *: remove jQuery from all assets",
+        _JQUERY_REMOVAL_PATCH, {"frontend.jquery": object()},
+    )
+    assert [r.kind for r in followup] == [Kind.ROLLOUT]
+
+
+def test_jquery_net_addition_does_not_fire():
+    # Subject mentions jQuery but the diff *adds* references (a shim, say).
+    patch = {"x.js": (
+        "@@ -1 +1,2 @@\n"
+        "     const a = 1;\n"
+        '+import jQuery from "jquery";\n'
+    )}
+    assert retired_deps.extract("[IMP] web: jquery compatibility shim", patch, {}) == []
+
+
+def test_retired_dep_subject_gate():
+    assert retired_deps.mentions_retired_dep("[REM] web: remove jQuery")
+    assert not retired_deps.mentions_retired_dep("[FIX] web: tidy imports")
+    # Unrelated subject short-circuits even with a jquery-shaped diff.
+    assert retired_deps.extract("[FIX] web: tidy imports", _JQUERY_REMOVAL_PATCH, {}) == []
+
+
+def test_net_removed_ignores_diff_headers():
+    # The `--- a/..jquery..` / `+++ b/..jquery..` headers must not count as
+    # content removals/additions.
+    patch = {"jquery_widget.js": (
+        "--- a/jquery_widget.js\n"
+        "+++ b/jquery_widget.js\n"
+        "@@ -1 +0,0 @@\n"
+        "-jQuery.fn.foo = 1;\n"
+    )}
+    assert retired_deps._net_removed("jquery", patch) == 1
