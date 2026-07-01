@@ -6,6 +6,7 @@ from ofd.scoring import (
     ScoreContext,
     aggregate_score,
     breadth_bonus,
+    dev_facing_tier,
     score_event,
     sort_records,
 )
@@ -167,6 +168,34 @@ def test_aggregate_score_clamped():
     config = ScoringConfig()
     # definition 4 + breadth 3 (≥50 rollouts) = 7 → clamp 5
     assert aggregate_score(4, 60, old, config, now) == 5
+
+
+def test_moved_relocation_penalty():
+    r = ChangeRecord(
+        kind=Kind.NEW_DECORATOR_OR_HELPER, file="odoo/tools/business_data.py",
+        line=1, symbol="odoo.tools.business_data.split_vat", moved=True,
+    )
+    ctx = _ctx(subject="[IMP] account: add generic VAT method")
+    score_event(r, ctx)
+    # base 2 - moved 3 = -1 -> clamp 0.
+    assert r.score == 0
+    assert any("moved_relocation:-3" in reason for reason in r.score_reasons)
+
+
+def test_dev_facing_tier_ordering():
+    # Extension points outrank narrower surface, deprecations, and churn.
+    assert dev_facing_tier("new_registry_category") == 0
+    assert dev_facing_tier("new_public_class") == 0
+    assert dev_facing_tier("new_module") == 0
+    assert dev_facing_tier("new_decorator_or_helper") == 1
+    assert dev_facing_tier("removed_public_symbol") == 2
+    assert dev_facing_tier("signature_change") == 3
+    # Unknown kinds fall into the churn tier, not the top.
+    assert dev_facing_tier("something_new") == 3
+    # A relocation sinks below every real kind, whatever its kind.
+    assert dev_facing_tier("new_public_class", moved=True) > dev_facing_tier(
+        "signature_change"
+    )
 
 
 def test_sort_records_by_score_then_kind():

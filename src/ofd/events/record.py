@@ -110,6 +110,14 @@ class ChangeRecord:
     # module, glue rather than a story. Set to True or left None (never
     # False) so `to_dict`'s None-filter keeps other kinds' JSON clean.
     auto_install: bool | None = None
+    # Set on a NEW_* definition that is really a relocation of existing
+    # code (see `ofd.moves`): a helper moved into a new file reads as
+    # brand-new API but carries no dev-facing novelty. `moved_from` holds
+    # the old symbol's FQN when a same-commit removal was paired; it is
+    # None when the move was inferred from the commit message alone.
+    # Set to True or left None (never False) so `to_dict` stays clean.
+    moved: bool | None = None
+    moved_from: str | None = None
 
     def to_dict(self) -> dict:
         raw = asdict(self)

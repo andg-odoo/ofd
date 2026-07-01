@@ -9,19 +9,28 @@ from ofd.cli.show import show
 from ofd.ledger.read import find, iter_entries
 
 
-def _write_entry(workspace: Path, subdir: str, symbol: str, body_extra: str = "") -> None:
+def _write_entry(
+    workspace: Path,
+    subdir: str,
+    symbol: str,
+    body_extra: str = "",
+    kind: str = "new_public_class",
+    score: int = 5,
+    rollout_count: int = 3,
+    extra_fm: str = "",
+) -> None:
     path = workspace / "ledger" / subdir / f"{symbol}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         f"""---
 symbol: {symbol}
-kind: new_public_class
+kind: {kind}
 active_version: "20.0"
 status: fresh
-score: 5
-rollout_count: 3
+score: {score}
+rollout_count: {rollout_count}
 first_seen: "2026-01-15"
----
+{extra_fm}---
 
 # {symbol.rsplit('.', 1)[-1]}
 
@@ -57,6 +66,50 @@ def test_list_cli_prints_one_line_per_entry(tmp_path: Path):
     # Score column first, symbol last.
     assert "odoo.orm.Alpha" in result.output
     assert "odoo.orm.Beta" in result.output
+
+
+def test_moved_frontmatter_read_by_entry(tmp_path: Path):
+    _write_entry(
+        tmp_path, "new-apis", "odoo.tools.business_data.split_vat",
+        kind="new_decorator_or_helper",
+        extra_fm="moved: true\nmoved_from: odoo.tools.legacy.split_vat\n",
+    )
+    entries = iter_entries(tmp_path)
+    entry = next(e for e in entries if e.symbol.endswith("split_vat"))
+    assert entry.moved is True
+    assert entry.moved_from == "odoo.tools.legacy.split_vat"
+
+
+def test_dev_sort_ranks_extension_points_over_churn_and_moves(tmp_path: Path):
+    # A widely-adopted relocation (high score + rollouts) must rank below
+    # a fresh, zero-rollout mixin under the dev sort.
+    _write_entry(
+        tmp_path, "new-apis", "odoo.tools.business_data.split_vat",
+        kind="new_decorator_or_helper", score=5, rollout_count=68,
+        extra_fm="moved: true\n",
+    )
+    _write_entry(
+        tmp_path, "new-apis", "odoo.addons.bus.models.BusSyncMixin",
+        kind="new_public_class", score=3, rollout_count=0,
+    )
+    _write_entry(
+        tmp_path, "new-apis", "odoo.orm.SomeMethod",
+        kind="signature_change", score=4, rollout_count=10,
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        list_cmd,
+        ["--workspace", str(tmp_path), "--sort", "dev", "--symbol-only"],
+    )
+    assert result.exit_code == 0
+    lines = [line for line in result.output.strip().splitlines() if line]
+    # Mixin (tier 0) first, signature_change (tier 3) next, moved last -
+    # despite the move having the highest score and rollout count.
+    assert lines == [
+        "odoo.addons.bus.models.BusSyncMixin",
+        "odoo.orm.SomeMethod",
+        "odoo.tools.business_data.split_vat",
+    ]
 
 
 def test_list_cli_symbol_only(tmp_path: Path):

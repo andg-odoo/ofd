@@ -83,6 +83,72 @@ _KIND_PRIORITY: dict[Kind, int] = {
     Kind.ROLLOUT: 99,
 }
 
+# Dev-facing tiers for `list --sort dev`. Lower = more directly
+# buildable-on by a third-party dev. The `score`/`weighted`/`breadth`
+# sorts all rank on rollout count, which measures Odoo's own internal
+# churn; this ranks by "can I extend the framework with this?" instead,
+# leaving rollout count as a secondary "how proven" tiebreak in the sort
+# key rather than the primary axis.
+_DEV_FACING_TIER: dict[Kind, int] = {
+    # Tier 0: prime extension points - new registries, base classes and
+    # mixins to inherit, whole new modules, module-level platform knobs,
+    # dependency epochs, and the declarative view/route/context surface.
+    Kind.NEW_REGISTRY_CATEGORY: 0,
+    Kind.NEW_PUBLIC_CLASS: 0,
+    Kind.NEW_MODULE: 0,
+    Kind.NEW_MANIFEST_KEY: 0,
+    Kind.DEPENDENCY_CHANGE: 0,
+    Kind.NEW_CONTEXT_KEY: 0,
+    Kind.NEW_ENDPOINT: 0,
+    Kind.NEW_VIEW_TYPE: 0,
+    Kind.NEW_VIEW_DIRECTIVE: 0,
+    # Tier 1: real but narrower API surface a dev still calls or adopts.
+    Kind.NEW_REGISTRY_ENTRY: 1,
+    Kind.NEW_JS_EXPORT: 1,
+    Kind.NEW_DECORATOR_OR_HELPER: 1,
+    Kind.NEW_KWARG: 1,
+    Kind.NEW_VIEW_ATTRIBUTE: 1,
+    Kind.NEW_VIEW_ELEMENT: 1,
+    Kind.NEW_FILE_CONVENTION: 1,
+    Kind.VENDORED_LIB_BUMP: 1,
+    # Tier 2: deprecation / removal stories - a dev must know, but it is
+    # not new surface to build on.
+    Kind.DEPRECATION_WARNING_ADDED: 2,
+    Kind.REMOVED_PUBLIC_SYMBOL: 2,
+    Kind.REMOVED_JS_EXPORT: 2,
+    Kind.REMOVED_VIEW_ATTRIBUTE: 2,
+    Kind.REMOVED_MODULE: 2,
+    # Tier 3: internal churn - signature reshuffles and private-ish
+    # class-attribute additions that measure Odoo's own refactoring, not
+    # third-party opportunity.
+    Kind.SIGNATURE_CHANGE: 3,
+    Kind.NEW_CLASS_ATTRIBUTE: 3,
+    Kind.ROLLOUT: 3,
+}
+
+_DEV_CHURN_TIER = 3
+"""Fallback tier for unknown kinds - treated as internal churn."""
+
+_DEV_MOVED_TIER = 4
+"""Relocations rank below every genuine kind: a moved helper is not new
+surface no matter how widely it is now called."""
+
+
+def dev_facing_tier(kind: str, moved: bool = False) -> int:
+    """Rank tier for `list --sort dev`; lower sorts higher.
+
+    `kind` is the string kind stored in ledger frontmatter. Moved
+    primitives are pushed below every real kind; unknown kinds fall into
+    the internal-churn tier.
+    """
+    if moved:
+        return _DEV_MOVED_TIER
+    try:
+        return _DEV_FACING_TIER.get(Kind(kind), _DEV_CHURN_TIER)
+    except ValueError:
+        return _DEV_CHURN_TIER
+
+
 _TAG_PATTERN = re.compile(r"^\[([A-Z]+)\]")
 
 
@@ -153,6 +219,13 @@ def score_event(record: ChangeRecord, ctx: ScoreContext) -> ChangeRecord:
     if record.auto_install:
         delta -= 1
         reasons.append("auto_install_bridge:-1")
+
+    if record.moved:
+        # A relocation is not new surface. Sink the definition score so it
+        # can't top a score-ranked view on the back of its move-driven
+        # rollout burst; the dev-facing sort demotes it further still.
+        delta -= 3
+        reasons.append("moved_relocation:-3")
 
     raw = base + delta
     final = max(0, min(5, raw))

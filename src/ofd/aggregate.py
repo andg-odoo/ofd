@@ -56,6 +56,10 @@ class Primitive:
     after_snippet: str | None = None
     warning_text: str | None = None
     removal_version: str | None = None
+    # True when a defining commit is really a relocation (see `ofd.moves`);
+    # `moved_from` is the old symbol FQN when a removal was paired.
+    moved: bool = False
+    moved_from: str | None = None
 
     @property
     def first_seen(self) -> datetime:
@@ -175,6 +179,13 @@ def build_primitives(
                             prim.signature = change.signature
                             prim.after_snippet = change.after_snippet
                             prim.active_version = commit_record.commit.active_version
+                    # Any defining commit that reads as a relocation marks
+                    # the primitive, so a later polish commit can't scrub
+                    # the flag and it never presents as brand-new API.
+                    if change.moved:
+                        prim.moved = True
+                        if change.moved_from and not prim.moved_from:
+                            prim.moved_from = change.moved_from
                     prim.definition_commits.append(ref)
                 elif change.kind == Kind.ROLLOUT:
                     prim = primitives.get(change.symbol)

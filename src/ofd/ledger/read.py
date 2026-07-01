@@ -47,6 +47,14 @@ class LedgerEntry:
     def active_version(self) -> str:
         return str(self.frontmatter.get("active_version") or "")
 
+    @property
+    def moved(self) -> bool:
+        return bool(self.frontmatter.get("moved"))
+
+    @property
+    def moved_from(self) -> str:
+        return str(self.frontmatter.get("moved_from") or "")
+
 
 def iter_entries(workspace: Path) -> list[LedgerEntry]:
     entries: list[LedgerEntry] = []

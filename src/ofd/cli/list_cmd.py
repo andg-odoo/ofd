@@ -9,6 +9,7 @@ import click
 
 from ofd.config import resolve_workspace
 from ofd.ledger.read import LedgerEntry, iter_entries
+from ofd.scoring import dev_facing_tier
 
 
 def _weeks_since(iso_date: str, now: datetime | None = None) -> float:
@@ -54,6 +55,12 @@ def _sort_keys():
         "velocity": lambda e: (-_velocity(e), e.symbol),
         # base score + recency boost, for release-proximity weighting
         "weighted": lambda e: (-(e.score + _recency_boost(e)), e.symbol),
+        # dev-facing surface first (extension points > churn), relocations
+        # last; score then rollout count are only tiebreaks within a tier
+        # so ranking tracks "can a dev build on it?" not internal churn.
+        "dev": lambda e: (
+            dev_facing_tier(e.kind, e.moved), -e.score, -e.rollout_count, e.symbol,
+        ),
     }
 
 
@@ -96,6 +103,11 @@ def list_cmd(
       score      - pure base score (default).
       weighted   - base score + recency boost (favors 19.4-era primitives
                    that haven't had full adoption time yet).
+      dev        - dev-facing surface first: extension points (registries,
+                   base classes/mixins, modules, manifest keys, deps, new
+                   view/route/context surface) rank above internal churn;
+                   relocations sink to the bottom. Score and rollout count
+                   are only tiebreaks within a tier.
       velocity   - rollouts per week since first_seen.
       breadth    - raw rollout count.
       date       - first_seen ascending.
@@ -122,9 +134,10 @@ def list_cmd(
     # Fall back to plain output when piped, asked, or no entries.
     if plain or not sys.stdout.isatty() or not entries:
         for e in entries:
+            marker = "  (moved)" if e.moved else ""
             click.echo(
                 f"{e.score}  {e.status:<20s}  {e.active_version:<8s}  "
-                f"{e.rollout_count:>4d}  {e.symbol}"
+                f"{e.rollout_count:>4d}  {e.symbol}{marker}"
             )
         return
 
@@ -137,10 +150,13 @@ def list_cmd(
     # avoids visual noise when the user isn't asking for velocity/weighted.
     show_velocity = sort == "velocity"
     show_weighted = sort == "weighted"
+    show_dev = sort == "dev"
     if show_weighted:
         table.add_column("+recency", justify="right", style="yellow")
     if show_velocity:
         table.add_column("v/wk", justify="right", style="cyan")
+    if show_dev:
+        table.add_column("Tier", justify="right", style="cyan")
     table.add_column("Status")
     table.add_column("Version", style="green")
     table.add_column("Rollouts", justify="right")
@@ -154,12 +170,15 @@ def list_cmd(
             row.append(f"+{_recency_boost(e):.1f}")
         if show_velocity:
             row.append(f"{_velocity(e):.2f}")
+        if show_dev:
+            row.append(str(dev_facing_tier(e.kind, e.moved)))
+        symbol_cell = f"{e.symbol} [dim](moved)[/]" if e.moved else e.symbol
         row += [
             f"[{style}]{e.status}[/]" if style else e.status,
             e.active_version or "-",
             str(e.rollout_count),
             e.kind,
-            e.symbol,
+            symbol_cell,
         ]
         table.add_row(*row)
 

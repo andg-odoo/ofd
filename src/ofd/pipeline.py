@@ -38,6 +38,7 @@ from ofd.extractors import (
 )
 from ofd.extractors.dispatcher import extract_for_file
 from ofd.globs import match_any
+from ofd.moves import detect_moves
 from ofd.release_detect import detect_version, is_release_file
 from ofd.rollouts import detect_rollouts, find_model_name
 from ofd.scoring import ScoreContext, score_event
@@ -464,6 +465,14 @@ def process_commit(
 
     if not changes:
         return None
+
+    # --- stage 3.5: move detection ---
+    # A NEW_* symbol that is really a relocation of existing code must not
+    # read as a fresh capability. Runs over the full change set so it can
+    # pair a same-commit removal (public->public move) or read the commit
+    # message (private->public / cross-file moves the extractors can't
+    # pair). Annotates in place; scoring reads the flag next.
+    detect_moves(changes, envelope)
 
     # --- stage 4: scoring ---
     ctx = ScoreContext(

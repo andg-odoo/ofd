@@ -227,6 +227,54 @@ def test_end_to_end_rollout_detected_when_commit_touches_framework(tmp_path: Pat
     assert rollout.model == "website"
 
 
+def test_end_to_end_relocation_flagged_and_demoted(tmp_path: Path, monkeypatch):
+    """A helper introduced by a commit that frames it as a move (the real
+    split_vat shape: private old name, non-gated old home, so no removal
+    event) is flagged `moved` and score-demoted, not scored as new API."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    repo = make_repo(tmp_path)
+
+    repo.commit(
+        {"odoo/orm/__init__.py": "", "odoo/orm/business_data.py": '"""stub."""\n'},
+        subject="[ADD] baseline",
+        author="Test User <test@example.com>",
+    )
+    move_sha = repo.commit(
+        {
+            "odoo/orm/business_data.py": (
+                '"""Business data helpers."""\n\n'
+                "def split_vat(vat):\n"
+                "    return vat[:2], vat[2:]\n"
+            ),
+        },
+        subject="[IMP] account: add a generic method for VAT number",
+        body="   - Move a generic method '_split_vat' from res_partner to tools\n",
+        author="Test User <test@example.com>",
+    )
+
+    workspace = tmp_path / "ws"
+    _write_config(workspace, repo.bare)
+    config = config_mod.load(workspace)
+    summary = run_pipeline(
+        config, state_mod.load(), watchlist_mod.load(workspace),
+    )
+    assert not summary.errors, summary.errors
+
+    record = next(
+        cr for cr in iter_repo(workspace, "odoo") if cr.commit.sha == move_sha
+    )
+    helper = next(
+        c for c in record.changes
+        if c.kind == Kind.NEW_DECORATOR_OR_HELPER
+        and c.symbol == "odoo.orm.business_data.split_vat"
+    )
+    assert helper.moved is True
+    assert any("moved_relocation" in r for r in helper.score_reasons)
+    # base 2 + core +1 + symbol +1 + key_dev +1 - moved 3 = 2; the -3
+    # penalty keeps it well below the 5 it would otherwise reach.
+    assert helper.score == 2
+
+
 def test_version_bump_updates_detected_version_and_stamps_next_commit(
     tmp_path: Path, monkeypatch,
 ):

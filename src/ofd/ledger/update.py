@@ -187,6 +187,12 @@ def update_one(
     }
     if prim.kind in _DEPRECATION_KINDS and prim.removal_version:
         frontmatter_data["removal_version"] = prim.removal_version
+    # Only emit the flag on actual relocations, so ordinary entries keep
+    # their frontmatter unchanged.
+    if prim.moved:
+        frontmatter_data["moved"] = True
+        if prim.moved_from:
+            frontmatter_data["moved_from"] = prim.moved_from
 
     regenerated = {
         "auto:summary": render_summary(prim, status),
