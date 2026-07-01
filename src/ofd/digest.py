@@ -26,10 +26,29 @@ from ofd.gitio import github_commit_url, resolve_github_base
 
 
 @dataclass
+class DeprecationEntry:
+    # "module" for a removed module, "warning" for a deprecation warning.
+    # The two render differently: a module removal has a name but no
+    # removal version (the module is just gone), while a deprecation
+    # warning carries the message text and sometimes a target version.
+    kind: str
+    symbol: str | None  # module symbol; None for bare deprecation warnings
+    removal_version: str | None
+    text: str  # module description, or the warning message
+    # Provenance: a bare warning like "Since 20.0 import ormcache from
+    # odoo.api" is opaque on its own, so we surface the commit that
+    # introduced it and the file:line it lives at.
+    repo: str = ""
+    sha: str = ""
+    file: str = ""
+    line: int = 0
+
+
+@dataclass
 class DigestSections:
     new_primitives: list[tuple[str, str, str]] = field(default_factory=list)  # (symbol, kind, subject)
     adoption_velocity: list[tuple[str, int, str, str]] = field(default_factory=list)  # (symbol, count, repo, sample_sha)
-    deprecations: list[tuple[str, str, str]] = field(default_factory=list)  # (symbol, removal_version, warning)
+    deprecations: list[DeprecationEntry] = field(default_factory=list)
 
 
 def _parse_iso(s: str) -> datetime:
@@ -47,7 +66,8 @@ def build_sections(
     new_by_symbol: dict[str, tuple[str, str]] = {}
     adoption_counts: dict[str, int] = defaultdict(int)
     adoption_sample: dict[str, tuple[str, str]] = {}  # symbol -> (repo, sha)
-    deprecations: list[tuple[str, str, str]] = []
+    deprecations: list[DeprecationEntry] = []
+    seen_deprecations: set[tuple[str, str | None, str, str]] = set()
 
     for repo in config.repos:
         for commit_record in iter_repo(workspace, repo.name):
@@ -60,27 +80,52 @@ def build_sections(
                         change.symbol,
                         (change.kind.value, commit_record.commit.subject),
                     )
-                elif change.kind == Kind.ROLLOUT and change.symbol:
+                    continue
+                if change.kind == Kind.ROLLOUT and change.symbol:
                     adoption_counts[change.symbol] += 1
                     adoption_sample.setdefault(
                         change.symbol,
                         (commit_record.commit.repo, commit_record.commit.sha),
                     )
-                elif change.kind == Kind.DEPRECATION_WARNING_ADDED:
-                    deprecations.append((
-                        change.symbol_hint or change.symbol or "?",
-                        change.removal_version or "-",
-                        change.warning_text or "",
-                    ))
+                    continue
+
+                if change.kind == Kind.DEPRECATION_WARNING_ADDED:
+                    # No symbol is attached - the warning message itself is
+                    # the payload, so render that rather than a "?" name.
+                    entry = DeprecationEntry(
+                        kind="warning",
+                        symbol=change.symbol_hint or change.symbol,
+                        removal_version=change.removal_version,
+                        text=change.warning_text or "",
+                        repo=commit_record.commit.repo,
+                        sha=commit_record.commit.sha,
+                        file=change.file,
+                        line=change.line,
+                    )
                 elif change.kind == Kind.REMOVED_MODULE:
                     # Module removals are rare and loud; surface them in
                     # the deprecations section rather than losing them
-                    # (REMOVED_MODULE isn't a definition kind).
-                    deprecations.append((
-                        change.symbol or "?",
-                        change.removal_version or "-",
-                        change.signature or "",
-                    ))
+                    # (REMOVED_MODULE isn't a definition kind). There's no
+                    # removal version - the module is simply gone.
+                    entry = DeprecationEntry(
+                        kind="module",
+                        symbol=change.symbol or "?",
+                        removal_version=None,
+                        text=change.signature or "",
+                        repo=commit_record.commit.repo,
+                        sha=commit_record.commit.sha,
+                        file=change.file,
+                        line=change.line,
+                    )
+                else:
+                    continue
+                # Dedup on location, not just text: the same warning may be
+                # added to several files in one commit, and each site is
+                # worth surfacing.
+                dedup_key = (entry.kind, entry.symbol, entry.text, entry.file)
+                if dedup_key not in seen_deprecations:
+                    seen_deprecations.add(dedup_key)
+                    deprecations.append(entry)
 
     sections = DigestSections()
     for sym, (kind, subject) in sorted(new_by_symbol.items()):
@@ -155,13 +200,46 @@ def render(
     lines.append("## Deprecations")
     lines.append("")
     if sections.deprecations:
-        for hint, removal, warning in sections.deprecations:
-            lines.append(f"- **{hint}** - removed in **{removal}**")
-            if warning:
-                lines.append(f"  > {warning}")
+        def _provenance(entry: DeprecationEntry) -> str:
+            # `file:line` plus a clickable commit when the repo source
+            # resolves to a GitHub URL (falls back to plain `repo@sha`).
+            loc = f"`{entry.file}:{entry.line}`" if entry.file else ""
+            sha = entry.sha[:12]
+            label = f"{entry.repo}@{sha}"
+            url = github_commit_url(sources_by_repo.get(entry.repo, ""), entry.sha)
+            commit = f"[`{label}`]({url})" if url else f"`{label}`"
+            return " · ".join(part for part in (loc, commit) if part)
+
+        removed_modules = [e for e in sections.deprecations if e.kind == "module"]
+        warnings = [e for e in sections.deprecations if e.kind == "warning"]
+        if removed_modules:
+            lines.append("### Removed modules")
+            lines.append("")
+            for entry in removed_modules:
+                suffix = f" - {entry.text}" if entry.text else ""
+                lines.append(f"- **{entry.symbol}**{suffix}")
+                lines.append(f"  {_provenance(entry)}")
+            lines.append("")
+        if warnings:
+            lines.append("### Deprecation warnings")
+            lines.append("")
+            for entry in warnings:
+                # The warning text is the headline; prepend the symbol when
+                # one is known and a "removed in X" badge when a target
+                # version was parsed out of the message. The source commit
+                # and file:line follow, since the message alone is opaque.
+                head = f"**{entry.symbol}** - " if entry.symbol else ""
+                badge = (
+                    f"removed in **{entry.removal_version}** - "
+                    if entry.removal_version
+                    else ""
+                )
+                lines.append(f"- {head}{badge}{entry.text}")
+                lines.append(f"  {_provenance(entry)}")
+            lines.append("")
     else:
         lines.append("_None._")
-    lines.append("")
+        lines.append("")
 
     return "\n".join(lines)
 

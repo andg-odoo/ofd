@@ -100,7 +100,8 @@ def test_digest_collects_all_three_sections(tmp_path: Path, monkeypatch):
         repo == "odoo" for _sym, _count, repo, _sha in sections.adoption_velocity
     )
     assert any(
-        removal == "21.0" for _hint, removal, _warn in sections.deprecations
+        e.kind == "warning" and e.removal_version == "21.0"
+        for e in sections.deprecations
     )
 
 
@@ -117,6 +118,24 @@ def test_digest_renders_markdown_with_headers(tmp_path: Path, monkeypatch):
     assert "## Adoption velocity" in content
     assert "## Deprecations" in content
     assert "CachedModel" in content
+
+
+def test_digest_deprecation_warnings_show_provenance(tmp_path: Path, monkeypatch):
+    """A bare deprecation warning is opaque on its own, so the digest must
+    surface the file:line it lives at, and never render the useless
+    `? - removed in -` placeholder."""
+    workspace = _seed(tmp_path, monkeypatch)
+    config = config_mod.load(workspace)
+
+    start = datetime.now(tz=UTC) - timedelta(days=30)
+    end = datetime.now(tz=UTC) + timedelta(days=1)
+    sections = build_sections(workspace, config, start, end)
+    content = render(sections, date(2026, 4, 17), repos=config.repos)
+
+    assert "### Deprecation warnings" in content
+    assert "AND is deprecated, use Domain.AND" in content
+    assert "`odoo/osv/expression.py:" in content  # file:line provenance
+    assert "? - removed in -" not in content  # the old useless placeholder
 
 
 def test_digest_empty_window_shows_placeholders(tmp_path: Path, monkeypatch):
