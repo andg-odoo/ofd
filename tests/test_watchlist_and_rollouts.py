@@ -217,6 +217,25 @@ def test_generic_name_join_matched_on_explicit_import():
     assert records[0].symbol == "odoo.orm.fields_relational.Many2many.join"
 
 
+def test_generic_name_len_ignores_builtin_len_calls():
+    """`BinaryValue.len` is a `@property` shim for the requests lib; its
+    short name collides with the Python builtin. A `len(...)` call or a
+    `.len` attribute read must NOT count as a rollout (26 bogus rollouts
+    across 12 addons in the real backfill)."""
+    wl = _watchlist_with("odoo.tools.binary.BinaryValue.len")
+    patch = """\
+--- a/x.py
++++ b/x.py
+@@ -1,2 +1,4 @@
+ a = 1
++    total = len(records)
++    return rec.len
+ b = 2
+"""
+    records = detect_rollouts({"x.py": patch}, wl, {})
+    assert records == []
+
+
 def test_context_match_requires_syntactic_position():
     """`CachedModel` in a string literal / comment must not match."""
     wl = _watchlist_with("odoo.orm.models_cached.CachedModel")

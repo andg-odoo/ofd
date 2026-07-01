@@ -222,6 +222,17 @@ _GENERIC_SHORT_NAMES: frozenset[str] = frozenset({
     # breadth (274 rollouts on conversion day) is already persisted;
     # import-only matching from here on just stops the FP drip.
     "website",
+    # `BinaryValue.len` (2026-06-11, opw-6272493) is a `@property`
+    # aliasing `size` so the `requests` lib can read a file size via
+    # `.len` - it's never *called* as `len(...)` in app code. But its
+    # NEW_DECORATOR_OR_HELPER short name `len` collides with the Python
+    # builtin: every `len(items)` call and `.len` attribute matched,
+    # yielding 26 bogus rollouts across 12 addons (none genuine - it's
+    # an internal compatibility shim). NEW_DECORATOR_OR_HELPER keeps the
+    # import-only gate and is blocked in VIEW, so an explicit
+    # `from odoo.tools.binary import len` is the only surviving surface
+    # (never happens), stopping the FP drip.
+    "len",
     # Ubiquitous parameter names - NEW_KWARG sub-symbols like
     # `SomeMethod.ids` would else match every `.ids` / `ids=` in Odoo.
     "ids", "id", "query", "table", "kind", "it", "model", "record",
