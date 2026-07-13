@@ -60,6 +60,23 @@ _OWL3_SUBJECT = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
+# The env-dismantling campaign (2026-07, mcm): "This commit is a step
+# to remove the env. The env does not exist in owl3 anymore but still
+# exists in odoo." Each step swaps an env member for a service
+# (`env.isSmall` -> ui service, 174 files) or renames the test-side env
+# plumbing (`makeMockEnv` -> `makeTestEnv`) - API swaps with no new
+# import, invisible to the content matcher for the same reason the OWL3
+# recipes are. Same epoch, distinct hint for curation.
+_ENV_REMOVAL_SUBJECT = re.compile(
+    r"""
+      replace\ env\.\w+                       # "replace env.isSmall by ..."
+    | remove\ \w+\ from\ (?:the\ )?env\b(?!\s+\w)  # "remove isDashboard from env"
+                                              # (not "... from env cache")
+    | makemockenv                             # test-side env plumbing rename
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
 # A migration must touch front-end code; a doc/test-only commit that
 # merely mentions OWL3 in its subject is not an adoption.
 _CODE_EXT = (".js", ".xml")
@@ -70,6 +87,16 @@ def is_migration_subject(subject: str | None) -> bool:
     return bool(subject and _OWL3_SUBJECT.search(subject))
 
 
+def _migration_hint(subject: str | None) -> str | None:
+    if not subject:
+        return None
+    if _OWL3_SUBJECT.search(subject):
+        return "owl3-migration"
+    if _ENV_REMOVAL_SUBJECT.search(subject):
+        return "owl3-env-removal"
+    return None
+
+
 def extract(subject: str | None, changed_files: list[str]) -> list[ChangeRecord]:
     """One `@odoo/owl` ROLLOUT when this commit is an OWL3 migration that
     actually touches front-end code, else an empty list.
@@ -78,7 +105,8 @@ def extract(subject: str | None, changed_files: list[str]) -> list[ChangeRecord]
     "how many migration commits", and per-file would inflate a single
     sweeping `[REF] *: ...` commit into thousands of adoptions.
     """
-    if not is_migration_subject(subject):
+    hint = _migration_hint(subject)
+    if hint is None:
         return []
     # The commit that bumps the OWL bundle itself (subject often says
     # "update owl to owl3") is the epoch *definition*, not an adopter -
@@ -93,5 +121,5 @@ def extract(subject: str | None, changed_files: list[str]) -> list[ChangeRecord]
         file=code_files[0],
         line=0,
         symbol=OWL_LIB_SYMBOL,
-        symbol_hint="owl3-migration",
+        symbol_hint=hint,
     )]

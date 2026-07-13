@@ -249,3 +249,30 @@ def test_test_convention_none_line_move_not_counted():
     assert test_conventions.extract(
         patches, known_symbols={"tests._test_user_groups"},
     ) == []
+
+
+# --- OWL env-removal campaign ------------------------------------------------
+
+
+def test_env_removal_subjects_emit_owl_rollout():
+    for subject in (
+        "[REF] *: replace env.isSmall by ui service",
+        "[REF] *: replace makeMockEnv by makeTestEnv",
+        "[IMP] spreadsheet: remove isDashboard from env",
+        "[IMP] spreadsheet: remove isDashboard from the env",
+    ):
+        records = owl_migration.extract(subject, ["addons/web/static/src/x.js"])
+        assert len(records) == 1, subject
+        assert records[0].symbol == "@odoo/owl"
+        assert records[0].symbol_hint == "owl3-env-removal"
+
+
+def test_env_removal_ignores_unrelated_env_subjects():
+    for subject in (
+        "[FIX] web: env vars not passed to subprocess",   # os env, not owl
+        "[IMP] mail: replace environment banner",          # no env member
+        "[FIX] orm: remove record from env cache",         # cache, not env member
+    ):
+        assert owl_migration.extract(
+            subject, ["addons/web/static/src/x.js"],
+        ) == [], subject
