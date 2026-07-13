@@ -276,3 +276,37 @@ def test_env_removal_ignores_unrelated_env_subjects():
         assert owl_migration.extract(
             subject, ["addons/web/static/src/x.js"],
         ) == [], subject
+
+
+def test_service_to_plugin_subjects_emit_owl_rollout():
+    for subject in (
+        "[REF] web: convert title service to plugin",
+        "[REF] web,upgrade_code: convert currency service to plugin",
+        "[REF] mail: convert discuss.upgrade service to plugin",
+        "convert offline service to offline plugin",
+        "[REF] web: use offline plugin instead of service",
+    ):
+        records = owl_migration.extract(subject, ["addons/web/static/src/x.js"])
+        assert len(records) == 1, subject
+        assert records[0].symbol == "@odoo/owl"
+        assert records[0].symbol_hint == "owl3-service-to-plugin"
+
+
+def test_service_to_plugin_recipe_only_commit_not_counted():
+    """The upgrade_code recipe addition (convert mobile useService to
+    plugin) is tooling, not front-end adoption."""
+    assert owl_migration.extract(
+        "[REF] upgrade_code: convert mobile useService to plugin",
+        ["odoo/upgrade_code/owl3-migration.py"],
+    ) == []
+
+
+def test_service_to_plugin_ignores_unrelated_subjects():
+    for subject in (
+        "[FIX] web: tooltip_service: avoid nested double tooltip",
+        "[IMP] html_editor: new plugin for tables",
+        "[FIX] mail: service worker cache invalidation",
+    ):
+        assert owl_migration.extract(
+            subject, ["addons/web/static/src/x.js"],
+        ) == [], subject

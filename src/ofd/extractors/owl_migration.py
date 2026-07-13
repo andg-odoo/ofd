@@ -77,6 +77,22 @@ _ENV_REMOVAL_SUBJECT = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
+# The service -> plugin conversions: OWL 3 ships a native `Plugin`
+# class (+ signals), and the env-coupled service registry is being
+# converted to it one service at a time ("convert currency service to
+# plugin", "use offline plugin instead of service"). The conversions
+# edit odoo/upgrade_code/owl3-migration.py - same recipe file, same
+# epoch. Each new XxxPlugin export is separately caught as a
+# NEW_JS_EXPORT primitive; this classifier adds the campaign-level
+# breadth number.
+_SERVICE_TO_PLUGIN_SUBJECT = re.compile(
+    r"""
+      convert\ [^\n]{0,40}service\ to\ [^\n]{0,30}plugin
+    | plugin\ instead\ of\ [^\n]{0,30}service
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
 # A migration must touch front-end code; a doc/test-only commit that
 # merely mentions OWL3 in its subject is not an adoption.
 _CODE_EXT = (".js", ".xml")
@@ -94,6 +110,8 @@ def _migration_hint(subject: str | None) -> str | None:
         return "owl3-migration"
     if _ENV_REMOVAL_SUBJECT.search(subject):
         return "owl3-env-removal"
+    if _SERVICE_TO_PLUGIN_SUBJECT.search(subject):
+        return "owl3-service-to-plugin"
     return None
 
 
