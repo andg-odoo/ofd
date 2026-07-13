@@ -35,6 +35,7 @@ from ofd.extractors import (
     modules,
     owl_migration,
     retired_deps,
+    test_conventions,
 )
 from ofd.extractors.dispatcher import extract_for_file
 from ofd.globs import match_any
@@ -395,6 +396,17 @@ def process_commit(
             all_patches = gitio.commit_diff_by_file(repo.mirror, sha)
         changes.extend(retired_deps.extract(
             envelope.subject, all_patches, watchlist.entries,
+        ))
+    #   - test-writing conventions (`_test_user_groups` test user, 2026-07):
+    #     the mechanism is outside every framework path and the attribute is
+    #     private, so a dedicated pass emits the epoch + per-file opt-in
+    #     rollouts (None placeholders excluded). Patch cost is amortized:
+    #     stage 3 builds all_patches for every commit anyway.
+    if test_conventions.touches_test_files(all_files):
+        if all_patches is None:
+            all_patches = gitio.commit_diff_by_file(repo.mirror, sha)
+        changes.extend(test_conventions.extract(
+            all_patches, watchlist.entries,
         ))
 
     # Collapse same-commit override duplicates before they reach the

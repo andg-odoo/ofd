@@ -24,6 +24,7 @@ _BASE: dict[Kind, int] = {
     # without any modifier help.
     Kind.VENDORED_LIB_BUMP: 4,
     Kind.DEPENDENCY_CHANGE: 4,
+    Kind.NEW_TEST_CONVENTION: 4,
     Kind.NEW_PUBLIC_CLASS: 3,
     Kind.NEW_ENDPOINT: 3,
     Kind.NEW_VIEW_TYPE: 3,
@@ -66,6 +67,7 @@ _KIND_PRIORITY: dict[Kind, int] = {
     Kind.NEW_VIEW_ELEMENT: 6,
     Kind.REMOVED_VIEW_ATTRIBUTE: 7,
     Kind.NEW_FILE_CONVENTION: 8,
+    Kind.NEW_TEST_CONVENTION: 8,
     Kind.NEW_DECORATOR_OR_HELPER: 9,
     Kind.NEW_KWARG: 10,
     Kind.NEW_VIEW_DIRECTIVE: 11,
@@ -100,6 +102,9 @@ _DEV_FACING_TIER: dict[Kind, int] = {
     Kind.DEPENDENCY_CHANGE: 0,
     Kind.NEW_CONTEXT_KEY: 0,
     Kind.NEW_ENDPOINT: 0,
+    # A test convention is how every dev writes tests from now on -
+    # prime "must know" surface even though it isn't a runtime API.
+    Kind.NEW_TEST_CONVENTION: 0,
     Kind.NEW_VIEW_TYPE: 0,
     Kind.NEW_VIEW_DIRECTIVE: 0,
     # Tier 1: real but narrower API surface a dev still calls or adopts.

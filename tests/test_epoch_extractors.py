@@ -6,7 +6,7 @@ removal), so they emit rollouts explicitly from the commit subject + diff.
 """
 
 from ofd.events.record import Kind
-from ofd.extractors import owl_migration, retired_deps
+from ofd.extractors import owl_migration, retired_deps, test_conventions
 
 # --- OWL 3 migration --------------------------------------------------------
 
@@ -115,3 +115,137 @@ def test_net_removed_ignores_diff_headers():
         "-jQuery.fn.foo = 1;\n"
     )}
     assert retired_deps._net_removed("jquery", patch) == 1
+
+
+# --- test-writing conventions (_test_user_groups) ---------------------------
+
+
+def _patch(*lines):
+    return "\n".join(lines)
+
+
+def test_test_convention_real_value_counts():
+    """A class declaring real groups (odoo#273014 commit 1) emits the
+    epoch definition plus one rollout for the file."""
+    patches = {
+        "addons/product/tests/common.py": _patch(
+            "@@ -8,0 +9,4 @@",
+            "+    _test_user_groups = (",
+            "+        'product.group_product_manager',",
+            "+    )",
+        ),
+    }
+    records = test_conventions.extract(patches, known_symbols=set())
+    assert [r.kind for r in records] == [Kind.NEW_TEST_CONVENTION, Kind.ROLLOUT]
+    assert all(r.symbol == "tests._test_user_groups" for r in records)
+
+
+def test_test_convention_none_placeholder_ignored():
+    """The 761-file FIXME stamp must not count as adoption."""
+    patches = {
+        "addons/mrp/tests/test_bom.py": _patch(
+            "+    _test_user_groups = None  # FIXME list needed groups",
+        ),
+        "addons/mrp/tests/test_order.py": _patch(
+            "+    _test_user_groups = None",
+        ),
+    }
+    assert test_conventions.extract(patches, known_symbols=set()) == []
+
+
+def test_test_convention_placeholder_conversion_counts():
+    """The chm rollout branches convert None -> real tuple; that IS the
+    adoption curve."""
+    patches = {
+        "addons/website/tests/test_views.py": _patch(
+            "-    _test_user_groups = None  # FIXME list needed groups",
+            "+    _test_user_groups = ('website.group_website_designer',)",
+        ),
+        "addons/website/tests/test_menu.py": _patch(
+            "-    _test_user_groups = None  # FIXME list needed groups",
+            "+    _test_user_groups = ('base.group_user',)",
+        ),
+    }
+    records = test_conventions.extract(
+        patches, known_symbols={"tests._test_user_groups"},
+    )
+    assert [r.kind for r in records] == [Kind.ROLLOUT, Kind.ROLLOUT]
+    assert {r.file for r in records} == {
+        "addons/website/tests/test_views.py",
+        "addons/website/tests/test_menu.py",
+    }
+
+
+def test_test_convention_known_symbol_skips_definition():
+    patches = {
+        "addons/sale/tests/common.py": _patch(
+            "+    _test_user_groups = ('sales_team.group_sale_manager',)",
+        ),
+    }
+    records = test_conventions.extract(
+        patches, known_symbols={"tests._test_user_groups"},
+    )
+    assert [r.kind for r in records] == [Kind.ROLLOUT]
+
+
+def test_test_convention_only_python_test_files():
+    """Non-test files never fire, even with the needle in the diff (docs,
+    the mechanism's own file is odoo/addons/base/tests/ so it IS a test
+    file - the definition correctly lands there)."""
+    patches = {
+        "addons/sale/models/sale_order.py": _patch(
+            "+    _test_user_groups = ('base.group_user',)",
+        ),
+        "odoo/tools/misc.py": _patch(
+            "+    _test_user_groups = ('base.group_user',)",
+        ),
+    }
+    assert test_conventions.extract(patches, known_symbols=set()) == []
+
+
+def test_test_convention_pipeline_gate():
+    assert test_conventions.touches_test_files(
+        ["addons/sale/tests/test_sale_order.py"],
+    )
+    assert not test_conventions.touches_test_files(
+        ["addons/sale/models/sale_order.py", "addons/web/static/tests/x.js"],
+    )
+
+
+def test_test_convention_none_removal_is_inheritance_opt_in():
+    """The master-tests-*-chm branches delete the placeholder so the class
+    inherits its Common base's real groups - that IS the opt-in."""
+    patches = {
+        "addons/mrp/tests/test_bom.py": _patch(
+            "-    _test_user_groups = None  # FIXME list needed groups",
+        ),
+    }
+    records = test_conventions.extract(
+        patches, known_symbols={"tests._test_user_groups"},
+    )
+    assert [r.kind for r in records] == [Kind.ROLLOUT]
+
+
+def test_test_convention_real_value_removal_not_counted():
+    """Dropping an explicit real value (class now inherits) is cleanup of
+    an already-opted-in class, not new adoption."""
+    patches = {
+        "addons/sale/tests/test_sale.py": _patch(
+            "-    _test_user_groups = ('sales_team.group_sale_salesman',)",
+        ),
+    }
+    assert test_conventions.extract(
+        patches, known_symbols={"tests._test_user_groups"},
+    ) == []
+
+
+def test_test_convention_none_line_move_not_counted():
+    patches = {
+        "addons/stock/tests/test_move.py": _patch(
+            "-    _test_user_groups = None  # FIXME list needed groups",
+            "+    _test_user_groups = None  # FIXME list needed groups",
+        ),
+    }
+    assert test_conventions.extract(
+        patches, known_symbols={"tests._test_user_groups"},
+    ) == []

@@ -152,6 +152,11 @@ _KIND_LANGUAGES: dict[Kind, frozenset[Language]] = {
     # definition kind; its row is inert symmetry.
     Kind.NEW_MODULE:                frozenset(),
     Kind.REMOVED_MODULE:            frozenset(),
+    # Test conventions adopt via extractor-emitted rollouts only
+    # (test_conventions.py); their underscore attribute names must
+    # never reach the content matcher - the `_test_user_groups = None`
+    # placeholder stamp spans 700+ files and would read as adoption.
+    Kind.NEW_TEST_CONVENTION:       frozenset(),
     # JS primitives (DESIGN-js.md, phases 2+3). Exports adopt via
     # import lines in .js (`_js_import_pattern`) and via component
     # tags (`<BadgeTag`) in OWL templates - QWEB scope, phase 3.

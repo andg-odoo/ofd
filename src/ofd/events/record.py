@@ -30,6 +30,7 @@ class Kind(StrEnum):
     NEW_MANIFEST_KEY = "new_manifest_key"
     NEW_MODULE = "new_module"
     REMOVED_MODULE = "removed_module"
+    NEW_TEST_CONVENTION = "new_test_convention"
     DEPENDENCY_CHANGE = "dependency_change"
     NEW_JS_EXPORT = "new_js_export"
     REMOVED_JS_EXPORT = "removed_js_export"
@@ -52,6 +53,7 @@ DEFINITION_KINDS = frozenset({
     Kind.NEW_FILE_CONVENTION,
     Kind.NEW_MANIFEST_KEY,
     Kind.NEW_MODULE,
+    Kind.NEW_TEST_CONVENTION,
     Kind.DEPENDENCY_CHANGE,
     Kind.NEW_JS_EXPORT,
     Kind.NEW_REGISTRY_CATEGORY,
