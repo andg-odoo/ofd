@@ -24,7 +24,7 @@ from ofd import state as state_mod
 from ofd import watchlist as watchlist_mod
 from ofd.config import Config, RepoConfig
 from ofd.events.record import ChangeRecord, CommitEnvelope, CommitRecord, Kind
-from ofd.events.store import raw_path
+from ofd.events.store import raw_path, read_if_exists
 from ofd.events.store import write as write_record
 from ofd.extractors import (
     context_keys,
@@ -791,4 +791,313 @@ def run(
     # need to remember the save calls.
     state_mod.save(state)
     watchlist_mod.save(watchlist, config.workspace)
+    return summary
+
+
+# --------------------------------------------------------------------------
+# Watchlist-changed replay (`ofd reindex --watchlist-changed`)
+#
+# The full reindex re-runs definition extraction over every in-window
+# commit (~13 min on the real corpus) just to recompute the content-matcher
+# rollout scan against the current watchlist. When the only thing that
+# changed is the watchlist itself - a manual `ofd watchlist add` pin whose
+# historical adoptions were never counted - re-extracting definitions is
+# pure waste: the definition side is a function of the diffs alone and
+# would reproduce byte-for-byte. The replay below skips stage 1 entirely,
+# re-runs ONLY stage 3 (the rollouts.py content matcher), and reuses every
+# other stored record verbatim. Stage 2 (watchlist growth) is not re-run
+# either - it is REPLAYED from the entries' stored first_seen_sha, so each
+# commit is scanned against the same watchlist state a full reindex would
+# have had (see `replay_repo` for why post-filtering isn't equivalent).
+# --------------------------------------------------------------------------
+
+
+def _split_stored_rollouts(
+    records: list[ChangeRecord],
+) -> tuple[list[ChangeRecord], list[ChangeRecord]]:
+    """Partition a stored raw's records into (preserved, content_matcher).
+
+    A raw carries ROLLOUT records from two independent sources:
+
+      - the content matcher (`rollouts.detect_rollouts`, pipeline stage 3),
+        a pure function of (commit diff, watchlist) - exactly what a
+        watchlist change must recompute; and
+      - extractor-emitted rollouts (file_conventions, modules, manifest_keys,
+        the js_ registry scan, owl_migration, retired_deps, test_conventions)
+        which are derived from the diff alone, NOT the watchlist's
+        content-matching surface, and must survive a replay untouched.
+
+    Discriminator: `_make_record` in rollouts.py always stamps a
+    `hunk_header` (the `@@ ... @@` line); no extractor-emitted rollout
+    ever sets one. `line` is NOT usable - modules/manifest_keys/js_ emit
+    rollouts with a nonzero source line and no hunk_header (verified across
+    the live workspace: every hunk_header-bearing rollout is content-matcher,
+    every hunk_header-less one is extractor-emitted, including nonzero-line
+    registry/module rollouts).
+
+    Legacy conservatism: a pre-schema rollout lacking a hunk_header is
+    treated as extractor-emitted and preserved. This can only ever cause a
+    replay to KEEP a record it wouldn't regenerate - never to silently drop
+    an extractor rollout it can't reproduce. (No such records exist in the
+    current workspace; hunk_header has always been written for stage-3 hits.)
+    """
+    preserved: list[ChangeRecord] = []
+    content: list[ChangeRecord] = []
+    for r in records:
+        if r.kind is Kind.ROLLOUT and r.hunk_header is not None:
+            content.append(r)
+        else:
+            preserved.append(r)
+    return preserved, content
+
+
+def _replay_commit(
+    repo: RepoConfig,
+    config: Config,
+    watchlist: Watchlist,
+    info: gitio.CommitInfo,
+    changed: list[str],
+    fetcher: gitio.BlobFetcher,
+    existing: CommitRecord | None,
+    active_version: str,
+) -> CommitRecord | None:
+    """Recompute ONLY the content-matcher rollouts for one commit.
+
+    Preserves the existing raw's commit envelope and every non-content-matcher
+    record byte-for-byte (definitions, extractor-emitted rollouts, their
+    stored scores). Returns the merged CommitRecord, or None when the commit
+    ends up with no events (caller deletes any stale file).
+    """
+    sha = info.sha
+    if existing is not None:
+        # Reuse the stored envelope verbatim - the replay must not perturb
+        # committed_at / active_version / subject a full run already wrote.
+        envelope = existing.commit
+        preserved, _stale_content = _split_stored_rollouts(existing.changes)
+    else:
+        # No prior raw: this commit had no detections before, but a
+        # newly-pinned symbol may now adopt here. Synthesize an envelope
+        # exactly as `process_commit` would (active_version tracked by the
+        # caller off release.py bumps, matching a full reindex).
+        envelope = CommitEnvelope(
+            sha=info.sha,
+            repo=repo.name,
+            branch=repo.branch,
+            active_version=active_version,
+            author_name=info.author_name,
+            author_email=info.author_email,
+            committed_at=info.committed_at,
+            subject=info.subject,
+            body=info.body,
+        )
+        preserved = []
+
+    # --- stage 3 replay: content-matcher rollout scan ---
+    # Identical to `process_commit`'s stage 3: scan only non-gated files,
+    # drop temporally-impossible hits, back-fill model names. `watchlist`
+    # is the caller's walk-order reconstruction of the state the full run's
+    # incrementally-grown watchlist had at this commit (see `replay_repo`) -
+    # group composition inside detect_rollouts (shared-short-name first-wins
+    # attribution) depends on exactly which entries exist, so handing it the
+    # final watchlist and post-filtering records is NOT equivalent. The
+    # temporal post-filter is still applied because the full reindex applies
+    # it too: it does the real work for earlier-repo entries (fully present
+    # during this repo's walk) and for date-inverted own-repo commits.
+    new_rollouts: list[ChangeRecord] = []
+    if watchlist.short_names():
+        all_patches = gitio.commit_diff_by_file(repo.mirror, sha)
+        gated_files = {f for f in changed if match_any(f, repo.framework_paths)}
+        patches = {
+            f: all_patches[f]
+            for f in changed
+            if f not in gated_files and f in all_patches
+        }
+        child_sources: dict[str, str | None] = {}
+        rollouts = detect_rollouts(
+            patches, watchlist, child_sources,
+            fetch_child=lambda f: fetcher.fetch(sha, f),
+        )
+        rollouts = [
+            r for r in rollouts
+            if _rollout_postdates_definition(r, watchlist, envelope.committed_at)
+        ]
+        hit_files = {r.file for r in rollouts if r.file not in child_sources}
+        for file in hit_files:
+            child_sources[file] = fetcher.fetch(sha, file)
+        for r in rollouts:
+            if r.model is None:
+                r.model = find_model_name(child_sources.get(r.file))
+        new_rollouts = rollouts
+
+    changes = preserved + new_rollouts
+    if not changes:
+        return None
+
+    # Score only the freshly-scanned rollouts through the same path a full
+    # reindex uses; preserved records keep their stored scores.
+    ctx = ScoreContext(
+        commit=envelope,
+        core_paths=repo.core_paths,
+        key_devs=config.key_devs,
+        intent_keywords=config.scoring.intent_keywords,
+    )
+    for r in new_rollouts:
+        score_event(r, ctx)
+
+    return CommitRecord(commit=envelope, changes=changes)
+
+
+def replay_repo(
+    repo: RepoConfig,
+    config: Config,
+    state: State,
+    watchlist: Watchlist,
+    since_override: str | None = None,
+    later_repos: frozenset[str] = frozenset(),
+    progress_cb: ProgressCb | None = None,
+    status_cb: StatusCb | None = None,
+) -> list[CommitSummary]:
+    """Re-run only the content-matcher rollout scan for one repo.
+
+    Enumerates the same commit window a full reindex would (via
+    `log_commits_with_files`, bounded by `--since` SHA or the config date
+    floor), but for each commit runs `_replay_commit` instead of the full
+    `process_commit`. Definition extraction and watchlist building are
+    skipped: the watchlist on disk is the fixed input.
+
+    Parity requires reconstructing the watchlist STATE the full reindex had
+    at each commit, not just post-filtering records by date - detect_rollouts'
+    shared-short-name attribution (first-wins per hunk, alphabetical) changes
+    with group membership, so an entry that "shouldn't count yet" can steal a
+    hunk from the entry the full run credited, and the date post-filter then
+    deletes the rollout outright. Reconstruction, in walk order:
+
+      - manual pins + annotated entries: always active (`reindex` seeds them
+        into the watchlist before the walk starts);
+      - entries defined by repos processed EARLIER in
+        `_ordered_for_watchlist_build` order: fully active (their repo's walk
+        completed before this one began);
+      - entries from `later_repos`: excluded outright - they did not exist
+        at any point of this repo's walk in a full reindex, and no date
+        filter can express that (the adopting commit may genuinely postdate
+        the definition);
+      - own-repo entries: activated when the walk reaches their
+        first_seen_sha, BEFORE that commit's scan (stage 2 runs before
+        stage 3 in `process_commit`, so a definition's own commit can carry
+        its first rollouts). Sha-activation, not date comparison, is what
+        gets same-timestamp neighbours and date-inverted (rebased) commits
+        right. Own-repo entries whose defining sha isn't in this window
+        (older since_date, hand-edited watchlist) are conservatively active
+        from the start; the temporal post-filter still bounds them.
+    """
+    repo_state = state.get(repo.name)
+    since_sha = since_override or repo_state.last_seen_sha
+    since_date = config.since_date if since_sha is None else None
+
+    if status_cb:
+        bound = since_sha[:10] if since_sha else since_date or "full history"
+        status_cb(f"{repo.name}: enumerating commits (since {bound})...")
+
+    commits_with_files = gitio.log_commits_with_files(
+        repo.mirror, repo.branch, since_sha=since_sha, since_date=since_date,
+    )
+    total = len(commits_with_files)
+    if status_cb:
+        status_cb(f"{repo.name}: {total} commit(s) to replay")
+
+    walk_shas = {info.sha for info, _ in commits_with_files}
+    active = Watchlist()
+    pending: dict[str, list] = {}  # first_seen_sha -> entries to activate
+    for symbol, entry in watchlist.entries.items():
+        if entry.source == "manual" or entry.required_ancestor:
+            active.entries[symbol] = entry
+        elif entry.repo == repo.name and entry.first_seen_sha in walk_shas:
+            pending.setdefault(entry.first_seen_sha, []).append(entry)
+        elif entry.repo in later_repos:
+            continue
+        else:
+            active.entries[symbol] = entry
+
+    # Track the release series across the walk exactly as `run_repo` does,
+    # so a synthesized envelope for a newly-created raw is stamped with the
+    # same version a full reindex would give it.
+    detected_version = repo_state.detected_version
+
+    summaries: list[CommitSummary] = []
+    with gitio.BlobFetcher(repo.mirror) as fetcher:
+        for i, (info, changed) in enumerate(commits_with_files, start=1):
+            sha = info.sha
+            # Watchlist growth replay: this commit's definitions join
+            # before its own rollout scan, exactly like stage 2.
+            for entry in pending.pop(sha, ()):
+                active.entries[entry.symbol] = entry
+            for f in changed:
+                if is_release_file(f):
+                    v = detect_version(fetcher.fetch(sha, f))
+                    if v:
+                        detected_version = v
+                    break
+            active_version = detected_version or config.active_version
+
+            existing = read_if_exists(config.workspace, repo.name, sha)
+            # Nothing to do for a commit with no prior raw whose diff can't
+            # carry a rollout (no .py/.xml/.js). A commit that DOES have a
+            # prior raw is always processed - its content rollouts may need
+            # dropping if the watchlist shrank.
+            if existing is None and not _any_rollout_candidate(changed, active):
+                if progress_cb:
+                    progress_cb(repo.name, sha, i, total)
+                continue
+
+            record = _replay_commit(
+                repo, config, active, info, changed, fetcher,
+                existing, active_version,
+            )
+            if record:
+                write_record(config.workspace, record)
+                summaries.append(
+                    CommitSummary(sha=sha, changes=len(record.changes), persisted=True)
+                )
+            else:
+                # The only records were content-matcher rollouts of a
+                # since-removed entry: drop the now-empty file (mirrors
+                # `run_repo`'s stale-raw cleanup).
+                stale = raw_path(config.workspace, repo.name, sha)
+                if stale.exists():
+                    stale.unlink(missing_ok=True)
+                summaries.append(CommitSummary(sha=sha, changes=0, persisted=False))
+            if progress_cb:
+                progress_cb(repo.name, sha, i, total)
+
+    return summaries
+
+
+def replay(
+    config: Config,
+    state: State,
+    watchlist: Watchlist,
+    progress_cb: ProgressCb | None = None,
+    status_cb: StatusCb | None = None,
+) -> RunSummary:
+    """Watchlist-changed replay: recompute content-matcher rollouts only.
+
+    The watchlist is treated as read-only input (it already reflects the
+    manual pin / removal that triggered the replay), so - unlike `run` -
+    this neither rebuilds the watchlist from definitions nor advances/saves
+    per-repo state. The definition side of every raw is left untouched.
+    """
+    summary = RunSummary()
+    ordered = _ordered_for_watchlist_build(list(config.repos))
+    for i, repo in enumerate(ordered):
+        if not repo.mirror.exists():
+            summary.errors.append(f"{repo.name}: mirror missing at {repo.mirror}")
+            continue
+        try:
+            summary.repos[repo.name] = replay_repo(
+                repo, config, state, watchlist,
+                later_repos=frozenset(r.name for r in ordered[i + 1:]),
+                progress_cb=progress_cb, status_cb=status_cb,
+            )
+        except Exception as e:
+            summary.errors.append(f"{repo.name}: {e}")
     return summary

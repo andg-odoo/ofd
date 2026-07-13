@@ -39,6 +39,20 @@ def read(workspace: Path, repo: str, sha: str) -> CommitRecord:
         return CommitRecord.from_dict(json.load(f))
 
 
+def read_if_exists(workspace: Path, repo: str, sha: str) -> CommitRecord | None:
+    """Like `read`, but returns None when no raw exists for the sha.
+
+    Raw files exist ONLY for commits that had detections, so the rollout
+    replay (which walks every in-window commit) must tolerate the gap:
+    a newly-pinned symbol can produce the first rollout a commit ever
+    had, and there's no prior file to reuse."""
+    path = raw_path(workspace, repo, sha)
+    if not path.exists():
+        return None
+    with path.open() as f:
+        return CommitRecord.from_dict(json.load(f))
+
+
 def iter_repo(workspace: Path, repo: str) -> Iterator[CommitRecord]:
     """Yield all CommitRecords for a repo, in filesystem order."""
     base = workspace / "raw" / repo

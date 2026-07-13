@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import sys
 
+from ofd.pipeline import replay as replay_pipeline
 from ofd.pipeline import run as run_pipeline
 
 
-def run_pipeline_with_progress(config, state, watchlist):
-    """Call `pipeline.run` with a rich progress bar attached.
+def _pipeline_with_progress(pipeline_fn, config, state, watchlist):
+    """Call `pipeline_fn` (run or replay) with a rich progress bar attached.
 
     Always safe: if stderr isn't a TTY, or the user has NO_COLOR/--quiet
     upstream, the caller should simply bypass this helper. This function
@@ -60,9 +61,19 @@ def run_pipeline_with_progress(config, state, watchlist):
             # lines won't overwrite the active task row.
             progress.console.print(f"[dim]· {msg}[/]")
 
-        return run_pipeline(
+        return pipeline_fn(
             config, state, watchlist, progress_cb=cb, status_cb=status,
         )
+
+
+def run_pipeline_with_progress(config, state, watchlist):
+    """`pipeline.run` with a rich progress bar attached."""
+    return _pipeline_with_progress(run_pipeline, config, state, watchlist)
+
+
+def replay_pipeline_with_progress(config, state, watchlist):
+    """`pipeline.replay` (watchlist-changed rollout replay) with a bar."""
+    return _pipeline_with_progress(replay_pipeline, config, state, watchlist)
 
 
 def want_progress(quiet: bool = False, explicit_disable: bool = False) -> bool:
