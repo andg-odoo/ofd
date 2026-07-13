@@ -330,3 +330,85 @@ def f(a, b, /, *, c):
     assert "/" in sig[0].after_signature
     assert "*" in sig[0].after_signature
     assert "c" in sig[0].after_signature
+
+
+def test_new_annotated_class_attribute():
+    """Annotated class attrs (`x: int = 1`) were invisible pre-AnnAssign
+    support; outside fields modules they emit NEW_CLASS_ATTRIBUTE."""
+    parent = "class Registry:\n    pass\n"
+    child = "class Registry:\n    ready: bool = False\n"
+    records = extract(parent, child, "odoo/modules/registry.py")
+    attrs = [r for r in records if r.kind == Kind.NEW_CLASS_ATTRIBUTE]
+    assert len(attrs) == 1
+    assert attrs[0].symbol == "odoo.modules.registry.Registry.ready"
+    assert attrs[0].after_snippet == "    ready: bool = False"
+
+
+def test_new_field_attribute_is_field_kwarg():
+    """`init_storage: ... = None` on Field (odoo#256914). Field attrs
+    double as constructor kwargs, so the record is a NEW_KWARG with the
+    `__init__` symbol shape the constructor-call rollout matcher keys on."""
+    parent = '''\
+class Field:
+    compute_sudo: bool = True
+'''
+    child = '''\
+class Field:
+    compute_sudo: bool = True
+    init_storage: str | None = None  # initialize field values
+'''
+    records = extract(parent, child, "odoo/orm/fields.py")
+    kwargs = [r for r in records if r.kind == Kind.NEW_KWARG]
+    assert len(kwargs) == 1
+    assert kwargs[0].symbol == "odoo.orm.fields.Field.__init__.init_storage"
+    assert kwargs[0].signature == "init_storage: str | None = None"
+    assert not [r for r in records if r.kind == Kind.NEW_CLASS_ATTRIBUTE]
+
+
+def test_field_kwarg_on_subclass_and_plain_assign():
+    """The promotion covers every fields module layout and plain Assign
+    attrs too (`sanitize = True` on Html)."""
+    parent = "class Html(_String):\n    pass\n"
+    child = "class Html(_String):\n    sanitize = True\n"
+    records = extract(parent, child, "odoo/orm/fields_textual.py")
+    kwargs = [r for r in records if r.kind == Kind.NEW_KWARG]
+    assert len(kwargs) == 1
+    assert kwargs[0].symbol == "odoo.orm.fields_textual.Html.__init__.sanitize"
+
+
+def test_annotation_conversion_is_not_new():
+    """`x = 1` -> `x: int = 1` is the same attribute; the orm typing
+    sweep must not read as new API."""
+    parent = "class Field:\n    store = True\n"
+    child = "class Field:\n    store: bool = True\n"
+    assert extract(parent, child, "odoo/orm/fields.py") == []
+
+
+def test_removed_annotated_attribute():
+    parent = "class Field:\n    group_operator: str | None = None\n"
+    child = "class Field:\n    pass\n"
+    records = extract(parent, child, "odoo/orm/fields.py")
+    removed = [r for r in records if r.kind == Kind.REMOVED_PUBLIC_SYMBOL]
+    assert len(removed) == 1
+    assert removed[0].symbol == "odoo.orm.fields.Field.group_operator"
+
+
+def test_deprecated_decorator_captured():
+    """The `@deprecated(...)` decorator form (odoo#256914 deprecated
+    Model._init_column this way; warnings.warn never fires for it)."""
+    parent = '''\
+class Model:
+    def _init_column(self, name):
+        pass
+'''
+    child = '''\
+class Model:
+    @deprecated("Since 20.0, field initialization is defined in Field.init_storage")
+    def _init_column(self, name):
+        pass
+'''
+    records = extract(parent, child, "odoo/orm/models.py")
+    deps = [r for r in records if r.kind == Kind.DEPRECATION_WARNING_ADDED]
+    assert len(deps) == 1
+    assert deps[0].warning_text.startswith("Since 20.0")
+    assert deps[0].removal_version is None

@@ -28,6 +28,18 @@ from ofd.events.record import ChangeRecord, Kind
 # protocol, the context-manager protocol, hashing/equality, copy/reduce,
 # and `__set_name__`. Excludes `__init__` and `__new__` because changes
 # there reshape the public construction surface.
+# Modules whose class-body attributes double as constructor kwargs.
+# `Field.__init__` pours **kwargs into instance attributes, so a new
+# class-level attribute on a field class IS a new field kwarg
+# (`init_storage=`, `compute_sql=`). Emitting these as NEW_KWARG with a
+# `<Class>.__init__.<attr>` symbol opts them into the constructor-call
+# rollout matcher (`fields.Char(init_storage=...)` counts as adoption).
+# Covers both layout eras: `odoo/fields.py` (pre-orm-split, plus the
+# package form) and `odoo/orm/fields*.py`.
+_ATTR_AS_KWARG_MODULES = re.compile(
+    r"^odoo/(fields(/[^/]+)?|orm/fields[^/]*)\.py$"
+)
+
 _NOISY_DUNDER_METHODS: frozenset[str] = frozenset({
     "__repr__", "__str__", "__hash__", "__eq__", "__ne__",
     "__lt__", "__gt__", "__le__", "__ge__",
@@ -203,6 +215,25 @@ def _collect(tree: ast.Module, source: str) -> dict[str, _Symbol]:
                                 line=sub.lineno,
                                 source=sub_src,
                             )
+                elif (
+                    isinstance(sub, ast.AnnAssign)
+                    and isinstance(sub.target, ast.Name)
+                    and _is_public(sub.target.id)
+                ):
+                    # Annotated class attribute (`init_storage: str | None
+                    # = None`). The modern ORM declares field kwargs this
+                    # way; without this branch they were invisible.
+                    qname = f"{node.name}.{sub.target.id}"
+                    sub_src = _snippet(lines, sub.lineno, end_of(sub))
+                    value = f" = {ast.unparse(sub.value)}" if sub.value else ""
+                    table[qname] = _Symbol(
+                        name=qname,
+                        kind="attr",
+                        signature=f"{sub.target.id}: {ast.unparse(sub.annotation)}{value}",
+                        args_hash=None,
+                        line=sub.lineno,
+                        source=sub_src,
+                    )
         elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and _is_public(node.name):
             args = _render_args(node.args)
             src = _snippet(lines, node.lineno, end_of(node))
@@ -228,6 +259,21 @@ def _collect(tree: ast.Module, source: str) -> dict[str, _Symbol]:
                         line=node.lineno,
                         source=src,
                     )
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and _is_public(node.target.id)
+        ):
+            src = _snippet(lines, node.lineno, end_of(node))
+            value = f" = {ast.unparse(node.value)}" if node.value else ""
+            table[node.target.id] = _Symbol(
+                name=node.target.id,
+                kind="attr",
+                signature=f"{node.target.id}: {ast.unparse(node.annotation)}{value}",
+                args_hash=None,
+                line=node.lineno,
+                source=src,
+            )
 
     return table
 
@@ -235,6 +281,10 @@ def _collect(tree: ast.Module, source: str) -> dict[str, _Symbol]:
 _DEPRECATION_PATTERNS = [
     re.compile(r'warnings\.warn\s*\(\s*([rRuUbB]?["\'])(?P<msg>(?:(?!\1).)*)\1[^)]*DeprecationWarning', re.DOTALL),
     re.compile(r'warnings\.warn\s*\(\s*DeprecationWarning\s*\(\s*([rRuUbB]?["\'])(?P<msg>(?:(?!\1).)*)\1', re.DOTALL),
+    # `@deprecated("Since 20.0, use Field.init_storage")` - the decorator
+    # form (warnings.deprecated / typing_extensions / odoo.tools). The
+    # `@` anchor keeps plain `deprecated(...)` calls out.
+    re.compile(r'@deprecated\s*\(\s*([rRuUbB]?["\'])(?P<msg>(?:(?!\1).)*)\1', re.DOTALL),
 ]
 
 _REMOVAL_VERSION = re.compile(r'(?:removed|removal)\s+in\s+(?P<v>\d+\.\d+)', re.I)
@@ -347,13 +397,29 @@ def extract(
             ))
         elif sym.kind == "attr":
             if "." in name:
-                records.append(ChangeRecord(
-                    kind=Kind.NEW_CLASS_ATTRIBUTE,
-                    file=file,
-                    line=sym.line,
-                    symbol=fqn,
-                    after_snippet=sym.source,
-                ))
+                if _ATTR_AS_KWARG_MODULES.match(file):
+                    # Field-class attribute = constructor kwarg (see
+                    # _ATTR_AS_KWARG_MODULES). The `__init__` symbol
+                    # shape (`odoo.orm.fields.Field.__init__.init_storage`)
+                    # is what the rollout matcher keys "any
+                    # constructor-shaped call" validation on.
+                    cls_name, attr_name = name.split(".", 1)
+                    records.append(ChangeRecord(
+                        kind=Kind.NEW_KWARG,
+                        file=file,
+                        line=sym.line,
+                        symbol=f"{_qualify(file, cls_name)}.__init__.{attr_name}",
+                        signature=sym.signature,
+                        after_snippet=sym.source,
+                    ))
+                else:
+                    records.append(ChangeRecord(
+                        kind=Kind.NEW_CLASS_ATTRIBUTE,
+                        file=file,
+                        line=sym.line,
+                        symbol=fqn,
+                        after_snippet=sym.source,
+                    ))
             else:
                 # Module-level assignment of a public name - typically
                 # sentinel values or re-exports. Skip for now; too noisy.
