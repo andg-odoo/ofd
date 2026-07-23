@@ -114,7 +114,63 @@ def test_net_removed_ignores_diff_headers():
         "@@ -1 +0,0 @@\n"
         "-jQuery.fn.foo = 1;\n"
     )}
-    assert retired_deps._net_removed("jquery", patch) == 1
+    assert retired_deps._net_removed(("jquery",), patch) == 1
+
+
+# --- retired front-end dependency (Font Awesome) -----------------------------
+
+_FA_MIGRATION_PATCH = {
+    "addons/web/static/src/views/fields/badge.xml": (
+        "--- a/addons/web/static/src/views/fields/badge.xml\n"
+        "+++ b/addons/web/static/src/views/fields/badge.xml\n"
+        "@@ -1,2 +1,2 @@\n"
+        '-    <i class="fa fa-check"/>\n'
+        '+    <i class="oi" data-icon="check"/>\n'
+    ),
+}
+
+
+def test_fontawesome_retirement_fires_on_replacement_subject():
+    # Migration subjects name the NEW system (Material Symbols), not FA.
+    records = retired_deps.extract(
+        "[IMP] web, *: add Material Symbols icon system", _FA_MIGRATION_PATCH, {},
+    )
+    kinds = [(r.kind, r.symbol, r.symbol_hint) for r in records]
+    assert (Kind.DEPENDENCY_CHANGE, "frontend.fontawesome", "removed") in kinds
+    assert (Kind.ROLLOUT, "frontend.fontawesome", "removed") in kinds
+
+    followup = retired_deps.extract(
+        "[IMP] mass_mailing, website, *: apply data-icon in snippets",
+        _FA_MIGRATION_PATCH, {"frontend.fontawesome": object()},
+    )
+    assert [r.kind for r in followup] == [Kind.ROLLOUT]
+    assert followup[0].symbol == "frontend.fontawesome"
+
+
+def test_fontawesome_needles_counted_once_per_line():
+    # A line matching two diff needles must count once, and the lib css
+    # removal (font-awesome.css paths) counts via the file-content lines.
+    patch = {"addons/web/static/src/scss/x.scss": (
+        "@@ -1,2 +0,0 @@\n"
+        "-@import 'fontawesome/css/font-awesome';\n"
+        "-font-family: FontAwesome;\n"
+    )}
+    assert retired_deps._net_removed(
+        ("fontawesome", "font-awesome"), patch,
+    ) == 2
+
+
+def test_fontawesome_subject_gate_covers_campaign_forms():
+    for subject in (
+        "[IMP] *: remove FontAwesome font-family",
+        "[IMP] html_editor, html_builder, *: adapt media dialog for MS icons",
+        "[IMP] web, *: add Material Symbols icon system",
+    ):
+        assert retired_deps.mentions_retired_dep(subject), subject
+    # Icon-ish but unrelated subjects stay out.
+    assert not retired_deps.mentions_retired_dep(
+        "[FIX] website: support favicon for iOS PWA",
+    )
 
 
 # --- test-writing conventions (_test_user_groups) ---------------------------

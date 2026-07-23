@@ -15,23 +15,56 @@ the ledger both the "jQuery is gone" headline and a breadth count of how
 much of the code-base the cleanup swept through.
 
 Precision comes from two gates: the commit *subject* must name the
-dependency (a jQuery-removal commit always says so - it is the
-headline), and the diff must show a *net removal* of references (more
-removed than added), so a refactor that merely moves a `jquery` line
-never fires. Attribution is by explicit emission, never the content
-matcher.
+retirement campaign (any of the dep's subject needles - the replacement
+system's name counts, because a migration commit may only name what it
+migrates TO: the Font Awesome removal ran under "Material Symbols" /
+"data-icon" subjects), and the diff must show a *net removal* of
+references to the dep's diff needles (more removed than added), so a
+refactor that merely moves a reference never fires. Attribution is by
+explicit emission, never the content matcher.
 """
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 from ofd.events.record import ChangeRecord, Kind
 
+
+class _RetiredDep(NamedTuple):
+    slug: str  # ledger symbol is frontend.<slug>
+    display: str
+    # any-of, matched lower-cased against the commit subject
+    subject_needles: tuple[str, ...]
+    # references counted (once per diff line) for the net-removal gate
+    diff_needles: tuple[str, ...]
+
+
 # Curated pervasive front-end dependencies whose retirement is an epoch.
-# needle (lower-cased, matched against subject and diff lines) -> display.
 # Add an entry when another whole-code-base dependency is retired.
-_RETIRED_DEPS: dict[str, str] = {
-    "jquery": "jQuery",
-}
+_RETIRED_DEPS: tuple[_RetiredDep, ...] = (
+    _RetiredDep(
+        slug="jquery",
+        display="jQuery",
+        subject_needles=("jquery",),
+        diff_needles=("jquery",),
+    ),
+    # Font Awesome -> Material Symbols + reworked OI library (20.0,
+    # odoo 3e15a7be6940): migration subjects name the NEW system, not FA.
+    _RetiredDep(
+        slug="fontawesome",
+        display="Font Awesome",
+        subject_needles=(
+            "fontawesome",
+            "font awesome",
+            "font-awesome",
+            "material symbol",
+            "ms icons",
+            "data-icon",
+        ),
+        diff_needles=("fontawesome", "font-awesome", "font awesome", "fa fa-"),
+    ),
+)
 
 # Front-end / packaging files where a dependency reference lives: JS,
 # QWeb/templates, styles, and the manifest asset bundles.
@@ -39,16 +72,19 @@ _FRONTEND_EXT = (".js", ".xml", ".scss", ".css", ".py")
 
 
 def mentions_retired_dep(subject: str | None) -> bool:
-    """Cheap pipeline gate: does `subject` name a tracked dependency?
+    """Cheap pipeline gate: does `subject` name a tracked retirement?
     Avoids building the commit diff for the vast majority of commits."""
     subj = (subject or "").lower()
-    return any(needle in subj for needle in _RETIRED_DEPS)
+    return any(
+        needle in subj for dep in _RETIRED_DEPS for needle in dep.subject_needles
+    )
 
 
-def _net_removed(needle: str, patches: dict[str, str]) -> int:
-    """removed-minus-added count of diff lines mentioning `needle` across
-    front-end files. Positive means the commit strips more references
-    than it adds - a genuine retirement rather than a move or rename."""
+def _net_removed(needles: tuple[str, ...], patches: dict[str, str]) -> int:
+    """removed-minus-added count of diff lines mentioning any needle
+    (each line counted once) across front-end files. Positive means the
+    commit strips more references than it adds - a genuine retirement
+    rather than a move or rename."""
     removed = added = 0
     for file, patch in patches.items():
         if not file.endswith(_FRONTEND_EXT):
@@ -58,7 +94,8 @@ def _net_removed(needle: str, patches: dict[str, str]) -> int:
                 continue
             if line[1] == line[0]:  # diff header (+++/---), not a content line
                 continue
-            if needle not in line.lower():
+            lowered = line.lower()
+            if not any(needle in lowered for needle in needles):
                 continue
             if line[0] == "-":
                 removed += 1
@@ -82,16 +119,16 @@ def extract(
     """
     subj = (subject or "").lower()
     records: list[ChangeRecord] = []
-    for needle, display in _RETIRED_DEPS.items():
-        if needle not in subj:
-            continue  # subject must name the dependency
-        if _net_removed(needle, patches) <= 0:
+    for dep in _RETIRED_DEPS:
+        if not any(needle in subj for needle in dep.subject_needles):
+            continue  # subject must name the retirement campaign
+        if _net_removed(dep.diff_needles, patches) <= 0:
             continue  # not a net removal (added / moved / mentioned only)
         sample = next(
             (f for f in patches if f.endswith(_FRONTEND_EXT)),
             "",
         )
-        symbol = f"frontend.{needle}"
+        symbol = f"frontend.{dep.slug}"
         if symbol not in known_symbols:
             records.append(ChangeRecord(
                 kind=Kind.DEPENDENCY_CHANGE,
@@ -99,7 +136,7 @@ def extract(
                 line=0,
                 symbol=symbol,
                 symbol_hint="removed",
-                signature=f"{display} retired from the front-end",
+                signature=f"{dep.display} retired from the front-end",
             ))
         records.append(ChangeRecord(
             kind=Kind.ROLLOUT,
